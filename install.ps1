@@ -1,108 +1,82 @@
-# Install the workspace-main-conversation skill for DeepSeek Harness.
-#
-# Usage:
-#   .\install.ps1              # install to ~/.dsh/skills/
-#   .\install.ps1 -Force       # overwrite if already present
-#
-# This script is pure ASCII on purpose: Windows PowerShell 5.1 reads .ps1
-# as ANSI, so non-ASCII text without a BOM would be garbled. Keeping it ASCII
-# makes it work identically on PowerShell 5.1, PowerShell 7, and cross-platform.
-#
-# It only copies files. It never deletes anything.
-
 [CmdletBinding()]
 param(
-    [switch]$Force
+    [ValidateSet('Codex','DSH')][string]$Target = 'Codex',
+    [string]$Destination,
+    [switch]$Force,
+    [switch]$MergeLegacy
 )
-
 $ErrorActionPreference = 'Stop'
-
-$src = $PSScriptRoot
-$dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
-$dest = Join-Path $dshHome 'skills\workspace-main-conversation'
-
-Write-Host ""
-Write-Host "=== Installing workspace-main-conversation ===" -ForegroundColor Cyan
-Write-Host "  Source : $src"
-Write-Host "  Target : $dest"
-Write-Host ""
-
-$required = @('SKILL.md', 'check.mjs', 'audit-owners.mjs', 'selftest-portable.mjs', 'zstd-frames.mjs')
-$missing = @()
-foreach ($f in $required) {
-    if (-not (Test-Path (Join-Path $src $f))) { $missing += $f }
-}
-if ($missing.Count -gt 0) {
-    Write-Host "  [X] Missing source files:" -ForegroundColor Red
-    foreach ($m in $missing) { Write-Host "      - $m" -ForegroundColor Red }
-    exit 1
-}
-Write-Host "  [OK] All $($required.Count) source files present" -ForegroundColor Green
-
-if (Test-Path $dest) {
-    if (-not $Force) {
-        Write-Host ""
-        Write-Host "  [!] Target already exists: $dest" -ForegroundColor Yellow
-        Write-Host "      Re-run with -Force to overwrite" -ForegroundColor Yellow
-        exit 2
+if (-not $Destination) {
+    if ($Target -eq 'Codex') {
+        $skillHome = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME 'skills' } else { Join-Path $env:USERPROFILE '.agents\skills' }
+    } else {
+        $dataHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
+        $skillHome = Join-Path $dataHome 'skills'
     }
-    Write-Host "  [!] Target exists, overwriting (-Force)" -ForegroundColor Yellow
+    $Destination = Join-Path $skillHome 'workspace-main-conversation'
 }
-
-New-Item -ItemType Directory -Path $dest -Force | Out-Null
-$copied = 0
-foreach ($f in (Get-ChildItem $src -File)) {
-    if ($f.Name -eq 'install.ps1') { continue }
-    Copy-Item $f.FullName (Join-Path $dest $f.Name) -Force
-    $copied++
+$src = [IO.Path]::GetFullPath($PSScriptRoot)
+$dest = [IO.Path]::GetFullPath($Destination)
+if ($MergeLegacy -and (Split-Path -Leaf $dest) -ne 'workspace-main-conversation') { throw 'MergeLegacy requires the canonical skill directory name' }
+if ($src.TrimEnd('\','/') -eq $dest.TrimEnd('\','/')) { throw 'Source equals destination' }
+if (Test-Path -LiteralPath $dest) {
+    if (-not $Force) { throw 'Destination exists; use -Force to back it up and replace it' }
 }
-foreach ($d in (Get-ChildItem $src -Directory)) {
-    Copy-Item $d.FullName (Join-Path $dest $d.Name) -Recurse -Force
-    $copied++
+$nodePath = (Get-Command node -ErrorAction Stop).Source
+& $nodePath (Join-Path $src 'selftest-portable.mjs')
+if ($LASTEXITCODE -ne 0) { throw 'Source self-test failed; no installed files changed' }
+$parent = Split-Path -Parent $dest
+New-Item -ItemType Directory -Path $parent -Force | Out-Null
+# Keep backups outside the skill scan root so a stale copy is not rediscovered as
+# another skill. Fall back to $parent when the parent is a drive/filesystem root.
+$scanRoot = Split-Path -Parent $parent
+if (-not $scanRoot -or (Split-Path -Parent $scanRoot) -eq $scanRoot -or [IO.Path]::GetFullPath($scanRoot) -eq [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($parent))) {
+    $scanRoot = $parent
 }
-Write-Host "  [OK] Copied $copied item(s)" -ForegroundColor Green
-
-Write-Host ""
-Write-Host "=== Verify ===" -ForegroundColor Cyan
-$skillFile = Join-Path $dest 'SKILL.md'
-if (-not (Test-Path $skillFile)) {
-    Write-Host "  [X] SKILL.md was not copied" -ForegroundColor Red
-    exit 1
+$backupRoot = Join-Path $scanRoot 'skill-backups'
+$stage = Join-Path $parent ('.workspace-skill-stage-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $stage | Out-Null
+foreach ($item in (Get-ChildItem -LiteralPath $src -Force)) {
+    if ($item.Name -in @('.git','install.ps1')) { continue }
+    Copy-Item -LiteralPath $item.FullName -Destination $stage -Recurse -Force
 }
-
-$head = Get-Content $skillFile -TotalCount 1
-if ($head -ne '---') {
-    Write-Host "  [X] SKILL.md has no frontmatter" -ForegroundColor Red
-    exit 1
+& $nodePath (Join-Path $stage 'selftest-portable.mjs')
+if ($LASTEXITCODE -ne 0) { throw ('Staged self-test failed; stage retained at ' + $stage) }
+$backup = $null
+if (Test-Path -LiteralPath $dest) {
+    New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+    $backup = Join-Path $backupRoot ('workspace-main-conversation-' + [guid]::NewGuid().ToString('N'))
+    # Resolve both endpoints before moving the explicitly selected installation.
+    $existingPath = (Resolve-Path -LiteralPath $dest).ProviderPath
+    if ([IO.Path]::GetFullPath($existingPath) -ne $dest) { throw 'Destination validation failed' }
+    if ([IO.Path]::GetFullPath((Split-Path -Parent $backup)) -ne [IO.Path]::GetFullPath($backupRoot)) { throw 'Backup validation failed' }
+    Move-Item -LiteralPath $dest -Destination $backup
 }
-
-# DSH does not tolerate a BOM when parsing frontmatter.
-$bytes = [System.IO.File]::ReadAllBytes($skillFile)
-if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-    Write-Host "  [X] SKILL.md has a BOM - frontmatter will fail to parse" -ForegroundColor Red
-    Write-Host "      Re-save it as UTF-8 without BOM" -ForegroundColor Yellow
-    exit 1
+if ([IO.Path]::GetFullPath((Resolve-Path -LiteralPath $stage).ProviderPath) -ne [IO.Path]::GetFullPath($stage)) { throw 'Stage path validation failed' }
+if ([IO.Path]::GetFullPath((Split-Path -Parent $stage)) -ne [IO.Path]::GetFullPath($parent)) { throw 'Stage outside install root' }
+if ([IO.Path]::GetFullPath((Split-Path -Parent $dest)) -ne [IO.Path]::GetFullPath($parent)) { throw 'Destination outside install root' }
+try { Move-Item -LiteralPath $stage -Destination $dest }
+catch {
+    if ($backup -and -not (Test-Path -LiteralPath $dest)) { Move-Item -LiteralPath $backup -Destination $dest }
+    throw
 }
-Write-Host "  [OK] SKILL.md frontmatter OK, no BOM" -ForegroundColor Green
-
-Write-Host ""
-Write-Host "=== Portability self-test ===" -ForegroundColor Cyan
-$node = $null
-if (Get-Command node -ErrorAction SilentlyContinue) { $node = 'node' }
-elseif ($env:DSH_APP_EXE -and (Test-Path $env:DSH_APP_EXE)) { $node = $env:DSH_APP_EXE }
-
-if ($node) {
-    & $node (Join-Path $dest 'selftest-portable.mjs') 2>&1 | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "  [!] Self-test did not fully pass (check node >= 22)" -ForegroundColor Yellow
+$legacyBackup = $null
+if ($MergeLegacy) {
+    $legacy = Join-Path $parent 'detect-concurrent-workspace-edits'
+    if (Test-Path -LiteralPath (Join-Path $legacy 'SKILL.md')) {
+        $legacyRoot = Join-Path (Split-Path -Parent $parent) 'skill-backups'
+        New-Item -ItemType Directory -Path $legacyRoot -Force | Out-Null
+        $legacyBackup = Join-Path $legacyRoot ('detect-concurrent-workspace-edits-' + [guid]::NewGuid().ToString('N'))
+        $legacyResolved = (Resolve-Path -LiteralPath $legacy).ProviderPath
+        if ([IO.Path]::GetFullPath($legacyResolved) -ne [IO.Path]::GetFullPath($legacy)) { throw 'Legacy path validation failed' }
+        if ([IO.Path]::GetFullPath((Split-Path -Parent $legacy)) -ne [IO.Path]::GetFullPath($parent)) { throw 'Legacy source outside skill root' }
+        if ([IO.Path]::GetFullPath((Split-Path -Parent $legacyBackup)) -ne [IO.Path]::GetFullPath($legacyRoot)) { throw 'Legacy backup outside backup root' }
+        Move-Item -LiteralPath $legacy -Destination $legacyBackup
+        New-Item -ItemType Directory -Path $legacy | Out-Null
+        $encoding = New-Object Text.UTF8Encoding $false
+        foreach ($script in @('list-sessions.mjs','peek-session.mjs')) {
+            [IO.File]::WriteAllText((Join-Path $legacy $script), ("import '../workspace-main-conversation/" + $script + "';" + [Environment]::NewLine), $encoding)
+        }
     }
-} else {
-    Write-Host "  [!] node not found, skipping self-test. Run manually later:" -ForegroundColor Yellow
-    Write-Host "      node `"$(Join-Path $dest 'selftest-portable.mjs')`"" -ForegroundColor Yellow
 }
-
-Write-Host ""
-Write-Host "=== Done ===" -ForegroundColor Green
-Write-Host "  Restart DSH for the skill to appear."
-Write-Host "  Usage: node `"$(Join-Path $dest 'check.mjs')`" `"<workspace-path>`""
-Write-Host ""
+[pscustomobject]@{ installed=$dest; backup=$backup; legacyBackup=$legacyBackup; target=$Target } | ConvertTo-Json -Compress

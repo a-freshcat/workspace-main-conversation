@@ -1,11 +1,11 @@
 ---
 name: workspace-main-conversation
-description: 管理共享工作区的对话分工、产物归属与共享文件认领；进入已启用的工作区、准备共享写入或交接任务时使用。
+description: 管理共享工作区的对话分工、文件归属与认领归拢；进入已启用的工作区、共享写入或整理散落产物时使用。
 ---
 
-# 工作区协作 v2
+# 工作区协作 v2.1
 
-目标：用少量状态支持协作，细节按需读取。脚本路径相对本 skill 目录；工作区参数用绝对路径。适用于 Codex 和 DSH。
+目标：用少量状态支持协作，细节按需读取。具体任务分工以用户指派为准。脚本路径相对本 skill 目录；工作区参数用绝对路径。适用于 Codex 和 DSH。
 
 ## 进入或恢复
 
@@ -17,7 +17,7 @@ SESSION 使用运行环境给出的当前对话 id；不可获取时保留 unkno
 
 ## 执行
 
-- `role=main`：汇总登记任务，处理 alerts；阶段结束用 `summary` 生成 `sum.md`。
+- `role=main`：汇总登记任务，处理 alerts、审查冲突与重复劳动；阶段结束用 `summary` 生成 `sum.md`。
 - `role=child`：只维护自己的任务记录和产物；需要上下文时优先 `detail --task ID`。
 - 接任务、状态变化、结果交接时用 `task --file INPUT.json` 登记；字段和命令见 [命令参考](references/commands.md)。普通回复无需改台账。
 - 共享写入前先登记 `writes`；认领冲突则串行交接。`check` 核对已登记路径，编辑前重读目标文件。
@@ -27,6 +27,7 @@ SESSION 使用运行环境给出的当前对话 id；不可获取时保留 unkno
 
 `more=true` 用同一 `--since` 和 `--offset NEXT` 读完相关页，再保存 stamp。
 unknown、扫描不完整或解析错误都保留为问题；详细文件检查用 `check --offset N`。
-历史归属或 DSH 日志取证才读 [迁移与取证](references/migration.md)；日常不加载完整日志、历史台账或脚本源码。
+发现散落产物、归属不明或待认领 claims 时，读 [认领与归拢](references/organize.md)。
+需要 DSH 日志线索时才读 [取证命令](references/forensics.md)；旧工作区启用见 [迁移](references/migration.md)。日常只读简报。
 只依赖当下可用的状态；接管主对话用显式 `handoff`。文件时间不代表对话是否运行。
 这些记录协调合作，不替代工具权限，也不阻止未遵守约定的外部写入。

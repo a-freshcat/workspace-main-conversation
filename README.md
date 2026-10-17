@@ -1,14 +1,14 @@
-# workspace-main-conversation v2
+# workspace-main-conversation v2.1（合并版）
 
-DSH / Codex 的文件协作 skill。短入口 + 每任务独立状态 + 按会话过滤和增量简报。无需 npm 包，不调用模型/API，不读取完整会话日志。
+DSH / Codex 的文件协作 skill。保留短入口、独立状态与增量简报，新增散落文件认领、核对和归拢。DSH 取证工具已内置，异常时才读取相关日志；日常不解析日志。无需 npm 包，不调用模型/API。
 
 ## 安装
 
-PowerShell：`./install.ps1 -Target Codex` 或 `./install.ps1 -Target DSH`。默认拒绝覆盖；升级加 `-Force` 会先备份。安装不会启用任何工作区，也不会改原始产物。Codex 可在下一轮发现新 skill，未出现时重启；DSH 的技能列表刷新方式以实际版本为准。
+PowerShell：`./install.ps1 -Target Codex` 或 `./install.ps1 -Target DSH`。默认拒绝覆盖；升级加 `-Force` 会先备份。DSH 可加 `-MergeLegacy` 归档旧 detect-concurrent-workspace-edits 入口，并保留两个命令的兼容路径，避免重复发现 skill。安装不会启用工作区或整理实际产物。Codex 未显示新版时重启；DSH 以实际版本的刷新方式为准。
 
 ## 使用
 
-读 [SKILL.md](SKILL.md)，具体命令在 [references/commands.md](references/commands.md)。用户指定主对话后 init，再由各对话登记各自任务。context 是日常入口，check 是明确的文件核验，summary 为人生成台账。
+读 [SKILL.md](SKILL.md)，常规命令在 [references/commands.md](references/commands.md)。用户指定主对话后 init，各对话登记自己的任务。主对话统筹并审查冲突与重复劳动，具体任务分工以用户指派为准。context 是日常入口。散落文件整理才读 [认领与归拢](references/organize.md)，DSH 日志线索才读 [取证参考](references/forensics.md)。
 
 测试：`node --test tests/*.test.mjs`。冒烟检查：`node selftest-portable.mjs`，可额外传一个 zstd 文件。已在 Node v24.21.0 验证；zstd 功能需当前 Node 提供相应 API，协作命令本身只用基础内置模块。
 

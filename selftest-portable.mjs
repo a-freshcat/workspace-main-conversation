@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import assert from 'node:assert/strict';
 import { execute } from './scripts/workspace.mjs';
+import { executeOrganize } from './scripts/organize.mjs';
 import { decodeAll } from './zstd-frames.mjs';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'workspace-skill-smoke-'));
@@ -15,6 +16,7 @@ try {
   assert.equal(run('check').complete, true);
   run('summary', '--session', 'smoke-main');
   assert.equal(run('check').ok, true);
+  assert.equal(executeOrganize(['inventory','--workspace',root]).enabled,true);
   let decoding = 'unavailable';
   if (typeof zlib.zstdCompressSync === 'function') {
     const sample = path.join(root, 'sample.zstd');

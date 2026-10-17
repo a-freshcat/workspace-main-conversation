@@ -44,4 +44,4 @@ state 可选 `planned/doing/blocked/done/cancelled`。前三者保留资源认�
 
 输出为单行 JSON。退出码：0 操作成功或指定检查范围内无问题；1 有待处理的问题；2 输入/权限/身份/解析问题。`more` 表示输出尚未显示全部，不会静默丢掉异常；增加 offset 获取后续。failed/unknown/incomplete 不等于正常。资源冲突和占用任务返回错误；拿到对方最新状态后再协调。
 
-元数据目录 `.workspace/`：config.json 是唯一主身份；tasks/ 每任务一个文件；cache/ 是可丢弃的简报缓存；summary.json 保存汇总基线。修改通过临时文件替换，并用排他创建的 `.write-lock` 串行协调。锁竞争返回 BUSY，不自动抢锁；崩溃遗留时先确认没有管理命令在运行，再人工移走锁。会话身份是协作约定，不是安全认证。
+元数据目录 `.workspace/`：config.json 是唯一主身份；tasks/ 每任务一个文件；cache/ 是可丢弃的简报缓存；summary.json 保存汇总基线。claims 待办按需读取 [认领与归拢](organize.md)。修改通过临时文件替换，并用排他创建的 `.write-lock` 串行协调。锁竞争返回 BUSY，不自动抢锁；崩溃遗留时先确认没有管理命令在运行，再人工移走锁。会话身份是协作约定，不是安全认证。

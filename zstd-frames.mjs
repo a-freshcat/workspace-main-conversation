@@ -4,42 +4,36 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const MAGIC = 0xfd2fb528;
-function invalid(message, offset, incomplete = false) { throw Object.assign(new Error(`${message} at byte ${offset}`), { code: incomplete ? 'INCOMPLETE' : 'INVALID_ZSTD', offset }); }
+function invalid(message, offset, incomplete = false) { throw Object.assign(new Error(`${message} at byte ${offset}`), { code: incomplete ? 'INCOMPLETE_FRAME' : 'INVALID_ZSTD', offset }); }
+export function frameBounds(buf, start = 0) {
+  let p=start;
+  const need=n=>{if(p+n>buf.length)invalid('Incomplete frame',p,true);};
+  need(4);const magic=buf.readUInt32LE(p);p+=4;
+  if(magic>=0x184d2a50&&magic<=0x184d2a5f){need(4);const size=buf.readUInt32LE(p);p+=4;need(size);return {end:p+size,skip:true};}
+  if(magic!==MAGIC)invalid('Unexpected frame magic',start);
+  need(1);const descriptor=buf[p++];if(descriptor&8)invalid('Reserved frame bit',p-1);
+  const flag=descriptor>>>6,single=Boolean(descriptor&32);
+  const bytes=(single?0:1)+[0,1,2,4][descriptor&3]+(flag===0?(single?1:0):[0,2,4,8][flag]);
+  need(bytes);p+=bytes;
+  let last=false;
+  while(!last){
+    need(3);const h=buf.readUIntLE(p,3);p+=3;last=Boolean(h&1);
+    const type=(h>>>1)&3,size=h>>>3;
+    if(type===3||size>128*1024)invalid('Invalid block',p-3);
+    const stored=type===1?1:size;need(stored);p+=stored;
+  }
+  if(descriptor&4){need(4);p+=4;}
+  return {end:p,skip:false};
+}
 export function splitZstdFrames(buf) {
   if (!Buffer.isBuffer(buf)) throw new TypeError('Expected Buffer');
   if (!buf.length) invalid('Empty input', 0);
   const frames = [];
   let p = 0;
-  const need = n => { if (p + n > buf.length) invalid('Incomplete frame', p, true); };
   while (p < buf.length) {
-    need(4);
-    const magic = buf.readUInt32LE(p), start = p;
-    p += 4;
-    // Skippable frames have an explicit payload length; never search inside their bytes.
-    if (magic >= 0x184d2a50 && magic <= 0x184d2a5f) {
-      need(4); const size = buf.readUInt32LE(p); p += 4; need(size); p += size;
-      continue;
-    }
-    if (magic !== MAGIC) invalid('Unexpected frame magic', start);
-    need(1);
-    const descriptor = buf[p++];
-    if (descriptor & 8) invalid('Reserved frame bit', p - 1);
-    const fcsFlag = descriptor >>> 6, single = Boolean(descriptor & 32);
-    const headerBytes = (single ? 0 : 1) + [0, 1, 2, 4][descriptor & 3] + (fcsFlag === 0 ? (single ? 1 : 0) : [0, 2, 4, 8][fcsFlag]);
-    need(headerBytes); p += headerBytes;
-    let last = false;
-    while (!last) {
-      need(3);
-      const header = buf.readUIntLE(p, 3); p += 3;
-      last = Boolean(header & 1);
-      const type = (header >>> 1) & 3, size = header >>> 3;
-      if (type === 3) invalid('Reserved block type', p - 3);
-      if (size > 128 * 1024) invalid('Oversized block', p - 3);
-      const stored = type === 1 ? 1 : size;
-      need(stored); p += stored;
-    }
-    if (descriptor & 4) { need(4); p += 4; }
-    frames.push(buf.subarray(start, p));
+    const f=frameBounds(buf,p);
+    if(!f.skip)frames.push(buf.subarray(p,f.end));
+    p=f.end;
   }
   if (!frames.length) invalid('No data frames', p);
   return frames;

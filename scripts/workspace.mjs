@@ -118,7 +118,22 @@ function readTasks(ws) {
     return { ...normalized, rev, updatedAt };
   });
 }
-function alertsFor(tasks) {
+function readClaims(ws) {
+  const dir = path.join(metadata(ws), 'claims');
+  noLink(dir);
+  if (!present(dir)) return [];
+  const names = fs.readdirSync(dir).filter(n => n.endsWith('.json')).sort();
+  if (names.length > 1000) fail('REGISTRY_LIMIT', 'Archive completed organization plans explicitly');
+  return names.map(name => {
+    const file = path.join(dir, name); noLink(file);
+    if (fs.statSync(file).size > 256 * 1024) fail('SCHEMA', 'Organization plan too large');
+    const c = json(file);
+    if (c.schema !== 1 || c.id + '.json' !== name || !Array.isArray(c.entries) || c.entries.length > 50 || !Number.isSafeInteger(c.rev) || c.rev < 1 || !['proposed','accepted','copying','copied','complete','cancelled'].includes(c.status)) fail('SCHEMA', 'Invalid organization plan');
+    taskId(c.id); taskId(c.task); session(c.owner, true);
+    return c;
+  });
+}
+function alertsFor(tasks, claims = []) {
   const alerts = [];
   for (let a = 0; a < tasks.length; a++) for (let b = a + 1; b < tasks.length; b++) {
     const x = tasks[a], y = tasks[b];
@@ -126,11 +141,25 @@ function alertsFor(tasks) {
     if (!ACTIVE.has(x.state) || !ACTIVE.has(y.state)) continue;
     for (const p of x.writes) for (const q of y.writes) if (overlaps(p, q)) alerts.push({ type: 'resource_overlap', tasks: [x.id, y.id], path: p, otherPath: q });
   }
+  for (const c of claims.filter(c => !['complete','cancelled'].includes(c.status))) {
+    for (const t of tasks.filter(t => t.id !== c.task && ACTIVE.has(t.state))) {
+      for (const e of c.entries) for (const p of t.writes) if (overlaps(p, e.source) || overlaps(p, e.target)) alerts.push({ type: 'organization_resource_overlap', tasks: [c.task,t.id], plan: c.id, path: p });
+    }
+  }
   return alerts;
 }
 function snapshot(ws) {
-  const c = needConfig(ws), tasks = readTasks(ws);
-  return { config: c, tasks, alerts: alertsFor(tasks) };
+  const c = needConfig(ws), tasks = readTasks(ws), claims = readClaims(ws);
+  return { config: c, tasks, claims, alerts: alertsFor(tasks, claims) };
+}
+export function inspectWorkspace(workspace) {
+  const ws = fs.realpathSync(path.resolve(workspace));
+  if (!fs.statSync(ws).isDirectory()) fail('INVALID', 'Workspace must be a directory');
+  return { workspace: ws, ...(config(ws) ? snapshot(ws) : { config: null, tasks: [], claims: [], alerts: [] }) };
+}
+export function coordinate(workspace, action) {
+  const ws = fs.realpathSync(path.resolve(workspace));
+  return locked(ws, root => action({ workspace: ws, root, ...snapshot(ws) }));
 }
 function page(items, options) {
   const offset = Number(options.offset ?? 0), limit = Number(options.limit ?? 5);
@@ -148,6 +177,8 @@ function context(ws, options) {
     const ownIds = new Set(s.tasks.filter(t => t.owner === who).map(t => t.id));
     const ordered = s.tasks.filter(t => role === 'main' || ownIds.has(t.id)).sort((a, b) => Number(ACTIVE.has(b.state)) - Number(ACTIVE.has(a.state)) || a.id.localeCompare(b.id));
     const view = { epoch: s.config.epoch, role, tasks: ordered.map(t => brief(ws, t)), alerts: s.alerts.filter(a => role === 'main' || a.tasks.some(id => ownIds.has(id))) };
+    const pending = s.claims.filter(c => !['complete','cancelled'].includes(c.status) && (role === 'main' || c.owner === who)).map(c => ({ id: c.id, task: c.task, owner: c.owner, status: c.status, count: c.entries.length, rev: c.rev }));
+    if (pending.length) view.claims = pending;
     const stamp = sha(view).slice(0, 24);
     if (options.since === stamp) return { stamp, noChanges: true, scope: 'declared-metadata' };
     const cache = path.join(root, 'cache', sha(who) + '.json');
@@ -162,9 +193,11 @@ function context(ws, options) {
     const alerts = previous ? changed(view.alerts, previous.alerts, sha) : view.alerts;
     const removedTasks = previous ? previous.tasks.filter(t => !view.tasks.some(n => n.id === t.id)).map(t => t.id) : [];
     const resolvedAlerts = previous ? previous.alerts.filter(a => !view.alerts.some(n => sha(n) === sha(a))) : [];
+    const claims = previous ? changed(view.claims || [], previous.claims || [], c => c.id) : view.claims || [];
+    const resolvedClaims = previous ? (previous.claims || []).filter(c => !(view.claims || []).some(n => n.id === c.id)).map(c => c.id) : [];
     history = [{ stamp, view }, ...history.filter(h => h.stamp !== stamp)].slice(0, 2);
     atomic(cache, history);
-    return { stamp, role, epoch: view.epoch, mode: previous ? 'delta' : 'snapshot', ...(options.since && !previous ? { reset: true } : {}), scope: 'declared-metadata', taskCount: view.tasks.length, alertCount: view.alerts.length, tasks: page(tasks, options), alerts: page(alerts, options), removedTasks: page(removedTasks, options), resolvedAlerts: page(resolvedAlerts, options) };
+    return { stamp, role, epoch: view.epoch, mode: previous ? 'delta' : 'snapshot', ...(options.since && !previous ? { reset: true } : {}), scope: 'declared-metadata', taskCount: view.tasks.length, alertCount: view.alerts.length, tasks: page(tasks, options), alerts: page(alerts, options), removedTasks: page(removedTasks, options), resolvedAlerts: page(resolvedAlerts, options), ...(pending.length || resolvedClaims.length ? { claims: page(claims,options), resolvedClaims: page(resolvedClaims,options) } : {}) };
   });
 }
 function register(ws, options) {
@@ -181,7 +214,7 @@ function register(ws, options) {
     const { rev: _r, updatedAt: _u, ...oldBody } = old || {};
     if (old && sha(oldBody) === sha(current)) return { id: old.id, rev: old.rev, noChanges: true };
     const others = s.tasks.filter(t => t.id !== current.id);
-    const clashes = alertsFor([...others, current]).filter(a => a.tasks.includes(current.id));
+    const clashes = alertsFor([...others, current], s.claims).filter(a => a.tasks.includes(current.id));
     if (clashes.length) fail('RESOURCE_CONFLICT', 'Declared resources overlap another task', page(clashes, options));
     const sid = path.join(current.directory, '.session-id');
     if (present(current.directory)) {

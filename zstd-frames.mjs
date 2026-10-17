@@ -1,64 +1,66 @@
-/**
- * 正确的多帧 zstd 解码 —— 按 zstd 帧格式走结构，而不是「试缩长度」。
- * magic: 28 B5 2F FD
- * Frame_Header_Descriptor (1 byte):
- *   bit7-6 Frame_Content_Size_flag, bit5 Single_Segment_flag,
- *   bit4 Unused, bit3 Reserved, bit2 Content_Checksum_flag, bit1-0 Dictionary_ID_flag
- * 之后按 flag 读 window/frame content size / dictID
- * 再循环 block：Block_Header (3 bytes LE) => bit0 last, bit2-1 type, bit23-3 size
- */
-import { readFileSync } from 'node:fs'
-import { zstdDecompressSync } from 'node:zlib'
+import { readFileSync } from 'node:fs';
+import * as zlib from 'node:zlib';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const DICT_ID_SIZE = [0, 1, 2, 4]
-const FCS_SIZE = [0, 2, 4, 8]
-
+const MAGIC = 0xfd2fb528;
+function invalid(message, offset, incomplete = false) { throw Object.assign(new Error(`${message} at byte ${offset}`), { code: incomplete ? 'INCOMPLETE' : 'INVALID_ZSTD', offset }); }
 export function splitZstdFrames(buf) {
-  const frames = []
-  let p = 0
-  while (p + 4 <= buf.length) {
-    // 对齐到 magic
-    if (!(buf[p] === 0x28 && buf[p + 1] === 0xb5 && buf[p + 2] === 0x2f && buf[p + 3] === 0xfd)) { p++; continue }
-    const start = p
-    p += 4
-    const fhd = buf[p++]
-    const fcsFlag = fhd >> 6
-    const singleSegment = (fhd >> 5) & 1
-    const checksum = (fhd >> 2) & 1
-    const dictFlag = fhd & 3
-    // Window descriptor（singleSegment=0 才有）
-    if (!singleSegment) p += 1
-    p += DICT_ID_SIZE[dictFlag]
-    p += FCS_SIZE[fcsFlag]
-    // blocks
-    let last = false
-    while (!last && p + 3 <= buf.length) {
-      const bh = buf[p] | (buf[p + 1] << 8) | (buf[p + 2] << 16)
-      p += 3
-      last = Boolean(bh & 1)
-      const btype = (bh >> 1) & 3
-      const bsize = bh >>> 3
-      if (btype === 1) p += 1              // RLE: 1 byte
-      else p += bsize                       // raw / compressed: bsize bytes
+  if (!Buffer.isBuffer(buf)) throw new TypeError('Expected Buffer');
+  if (!buf.length) invalid('Empty input', 0);
+  const frames = [];
+  let p = 0;
+  const need = n => { if (p + n > buf.length) invalid('Incomplete frame', p, true); };
+  while (p < buf.length) {
+    need(4);
+    const magic = buf.readUInt32LE(p), start = p;
+    p += 4;
+    // Skippable frames have an explicit payload length; never search inside their bytes.
+    if (magic >= 0x184d2a50 && magic <= 0x184d2a5f) {
+      need(4); const size = buf.readUInt32LE(p); p += 4; need(size); p += size;
+      continue;
     }
-    if (checksum) p += 4
-    frames.push(buf.subarray(start, Math.min(p, buf.length)))
+    if (magic !== MAGIC) invalid('Unexpected frame magic', start);
+    need(1);
+    const descriptor = buf[p++];
+    if (descriptor & 8) invalid('Reserved frame bit', p - 1);
+    const fcsFlag = descriptor >>> 6, single = Boolean(descriptor & 32);
+    const headerBytes = (single ? 0 : 1) + [0, 1, 2, 4][descriptor & 3] + (fcsFlag === 0 ? (single ? 1 : 0) : [0, 2, 4, 8][fcsFlag]);
+    need(headerBytes); p += headerBytes;
+    let last = false;
+    while (!last) {
+      need(3);
+      const header = buf.readUIntLE(p, 3); p += 3;
+      last = Boolean(header & 1);
+      const type = (header >>> 1) & 3, size = header >>> 3;
+      if (type === 3) invalid('Reserved block type', p - 3);
+      if (size > 128 * 1024) invalid('Oversized block', p - 3);
+      const stored = type === 1 ? 1 : size;
+      need(stored); p += stored;
+    }
+    if (descriptor & 4) { need(4); p += 4; }
+    frames.push(buf.subarray(start, p));
   }
-  return frames
+  if (!frames.length) invalid('No data frames', p);
+  return frames;
 }
-
-export function decodeAll(file) {
-  const buf = readFileSync(file)
-  const frames = splitZstdFrames(buf)
-  const parts = []
-  let failed = 0
-  for (const fr of frames) {
-    try { parts.push(zstdDecompressSync(fr)) } catch { failed++ }
+export function decodeAll(file, { maxOutputBytes = 64 * 1024 * 1024 } = {}) {
+  if (typeof zlib.zstdDecompressSync !== 'function') throw Object.assign(new Error('This Node runtime lacks zstdDecompressSync'), { code: 'RUNTIME' });
+  const frames = splitZstdFrames(readFileSync(file));
+  const parts = [];
+  let bytes = 0;
+  for (const frame of frames) {
+    const part = zlib.zstdDecompressSync(frame, { maxOutputLength: maxOutputBytes - bytes });
+    bytes += part.length;
+    if (bytes > maxOutputBytes) throw new Error('Decoded data exceeds limit');
+    parts.push(part);
   }
-  return { text: Buffer.concat(parts).toString('utf8'), total: frames.length, ok: frames.length - failed, failed }
+  return { text: Buffer.concat(parts).toString('utf8'), total: frames.length, ok: frames.length, failed: 0, complete: true };
 }
-
-if (process.argv[1]?.endsWith('zstd-frames.mjs')) {
-  const r = decodeAll(process.argv[2])
-  console.log(`frames=${r.total} ok=${r.ok} failed=${r.failed} chars=${r.text.length}`)
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    if (!process.argv[2]) throw new Error('Usage: node zstd-frames.mjs FILE');
+    const { text, ...stats } = decodeAll(process.argv[2]);
+    console.log(JSON.stringify({ ...stats, chars: text.length }));
+  } catch (e) { console.error(JSON.stringify({ complete: false, error: e.code || 'DECODE_ERROR', message: e.message })); process.exitCode = 2; }
 }

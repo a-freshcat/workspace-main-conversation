@@ -229,3 +229,62 @@ test('CLI decoding fails nonzero for malformed files, short valid sessions pass 
   assert.notEqual(spawnSync(process.execPath, [path.join(pkg, 'zstd-frames.mjs'), bad]).status, 0);
   assert.equal(spawnSync(process.execPath, [path.join(pkg, 'selftest-portable.mjs'), good]).status, 0);
 });
+
+// ── unregistered claims ──────────────────────────────────────────────────────
+// A conversation can write into the workspace without registering. `context`
+// used to read only the registry, so such a conversation was invisible to the
+// coordinator no matter how much it wrote. These tests pin the marker-based
+// detection that closes that gap, and the negative cases that keep it from
+// turning into "every directory is suspect".
+test('a marked but unregistered directory is reported to the coordinator', () => {
+  const ws = workspace();
+  const dir = path.join(ws, 'conversation-2026-01-01-other-work');
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, '.session-id'), 'child-lost\n');
+  fs.writeFileSync(path.join(dir, 'notes.md'), 'work');
+
+  const seen = run(ws, 'context', { session: 'main' });
+  assert.equal(seen.unregisteredCount, 1);
+  const [claim] = seen.unregistered.items;
+  assert.equal(claim.path, 'conversation-2026-01-01-other-work');
+  assert.equal(claim.owner, 'child-lost');
+  assert.equal(claim.files, 2); // .session-id + notes.md
+});
+test('an unregistered claim is visible only to the conversation named in its marker', () => {
+  const ws = workspace();
+  const mine = path.join(ws, 'mine'), theirs = path.join(ws, 'theirs');
+  for (const [dir, owner] of [[mine, 'child-a'], [theirs, 'child-b']]) {
+    fs.mkdirSync(dir); fs.writeFileSync(path.join(dir, '.session-id'), owner + '\n');
+  }
+  const a = run(ws, 'context', { session: 'child-a' });
+  assert.equal(a.unregisteredCount, 1);
+  assert.equal(a.unregistered.items[0].path, 'mine');
+  assert.equal(run(ws, 'context', { session: 'child-b' }).unregistered.items[0].path, 'theirs');
+  // A conversation with no claim of its own sees none, and is not told about others'.
+  assert.equal(run(ws, 'context', { session: 'child-c' }).unregisteredCount, undefined);
+});
+test('registration clears the claim; ordinary directories and unmarked ones are never reported', () => {
+  const ws = workspace();
+  const claimed = path.join(ws, 'claimed');
+  fs.mkdirSync(claimed); fs.writeFileSync(path.join(claimed, '.session-id'), 'child-a\n');
+  fs.mkdirSync(path.join(ws, 'src'));        // ordinary project dir, no marker
+  fs.mkdirSync(path.join(ws, 'unmarked'));   // directory without a marker
+  fs.writeFileSync(path.join(ws, 'unmarked', 'a.txt'), 'x');
+  assert.equal(run(ws, 'context', { session: 'main' }).unregisteredCount, 1);
+
+  task(ws, 'task-a', 'child-a', { directory: 'claimed' }, { adopt: true });
+  assert.equal(run(ws, 'context', { session: 'main' }).unregisteredCount, undefined);
+});
+test('a claim is reported once, not per file, and excluded roots stay excluded', () => {
+  const ws = workspace();
+  const dir = path.join(ws, 'busy');
+  fs.mkdirSync(path.join(dir, 'deep', 'deeper'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.session-id'), 'child-a\n');
+  for (let i = 0; i < 5; i++) fs.writeFileSync(path.join(dir, 'deep', 'deeper', `f${i}.txt`), 'x');
+  // node_modules is excluded from the file count and never walked for markers.
+  fs.mkdirSync(path.join(ws, 'node_modules')); fs.writeFileSync(path.join(ws, 'node_modules', '.session-id'), 'ghost\n');
+
+  const seen = run(ws, 'context', { session: 'main' });
+  assert.equal(seen.unregisteredCount, 1);
+  assert.equal(seen.unregistered.items[0].files, 6); // marker + 5 nested files
+});

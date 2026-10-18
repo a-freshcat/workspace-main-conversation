@@ -148,9 +148,80 @@ function alertsFor(tasks, claims = []) {
   }
   return alerts;
 }
+/**
+ * Directories that carry a `.session-id` marker but belong to no registered task.
+ *
+ * The marker is the skill's own claim of authorship (`task` writes it when it
+ * adopts a directory), so a marked-but-unregistered directory is a conversation
+ * that has written into this workspace WITHOUT registering — the exact blind spot
+ * that let three sibling conversations build 90+ files, invisible to the
+ * coordinator, until someone ran `ls`. `context` alone could never surface them:
+ * it reads the registry, and an unregistered conversation has no registry entry
+ * to read.
+ *
+ * Deliberately keyed on the marker, not on "a directory exists": ordinary
+ * project directories (`src/`, `docs/`) must never be reported, and a name or
+ * mtime is not ownership. Excluded roots and links are skipped for the same
+ * reason the file scan skips them.
+ *
+ * @returns Unregistered claims, each naming the directory, the session in its
+ *   marker, and how many files it holds.
+ */
+function unregisteredDirectories(ws, tasks) {
+  const base = canonical(ws, '.');
+  const registered = tasks.map(t => t.directory);
+  const found = [];
+  const seen = new Set();
+  const walk = (dir, depth) => {
+    if (depth > 4 || found.length >= 50) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (found.length >= 50) return;
+      if (!entry.isDirectory()) continue;
+      if (EXCLUDED.has(entry.name)) continue;
+      const full = path.join(dir, entry.name);
+      if (seen.has(full)) continue;
+      seen.add(full);
+      // A registered directory and everything above/below it is accounted for.
+      if (registered.some(r => overlaps(r, full))) continue;
+      const marker = path.join(full, '.session-id');
+      if (present(marker)) {
+        try {
+          if (fs.lstatSync(marker).isSymbolicLink()) continue;
+          if (fs.lstatSync(marker).size > 1024) continue;
+          const owner = fs.readFileSync(marker, 'utf8').trim();
+          if (owner) {
+            found.push({ path: portable(ws, full), owner, files: countFilesShallow(full) });
+            continue; // one alert per marked directory; its children are its own
+          }
+        } catch { /* unreadable marker is not a claim */ }
+      }
+      walk(full, depth + 1);
+    }
+  };
+  walk(base, 0);
+  return found;
+}
+/** Count regular files below a directory, bounded so one huge tree cannot stall `context`. */
+function countFilesShallow(dir) {
+  let total = 0;
+  const walk = (d, depth) => {
+    if (depth > 8 || total >= 5000) return;
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (total >= 5000) return;
+      if (entry.isDirectory()) { if (!EXCLUDED.has(entry.name)) walk(path.join(d, entry.name), depth + 1); }
+      else total += 1;
+    }
+  };
+  walk(dir, 0);
+  return total;
+}
 function snapshot(ws) {
   const c = needConfig(ws), tasks = readTasks(ws), claims = readClaims(ws);
-  return { config: c, tasks, claims, alerts: alertsFor(tasks, claims) };
+  return { config: c, tasks, claims, alerts: alertsFor(tasks, claims), unregistered: unregisteredDirectories(ws, tasks) };
 }
 export function inspectWorkspace(workspace) {
   const ws = fs.realpathSync(path.resolve(workspace));
@@ -177,6 +248,12 @@ function context(ws, options) {
     const ownIds = new Set(s.tasks.filter(t => t.owner === who).map(t => t.id));
     const ordered = s.tasks.filter(t => role === 'main' || ownIds.has(t.id)).sort((a, b) => Number(ACTIVE.has(b.state)) - Number(ACTIVE.has(a.state)) || a.id.localeCompare(b.id));
     const view = { epoch: s.config.epoch, role, tasks: ordered.map(t => brief(ws, t)), alerts: s.alerts.filter(a => role === 'main' || a.tasks.some(id => ownIds.has(id))) };
+    // An unregistered claim is addressed to its OWN conversation: that child can
+    // act on it (register, or say why the directory is not its business), and no
+    // one else can. The coordinator sees all of them because chasing them down
+    // is its job; `main` never registers on a child's behalf.
+    const unregistered = role === 'main' ? s.unregistered : s.unregistered.filter(u => u.owner === who);
+    if (unregistered.length) view.unregistered = unregistered;
     const pending = s.claims.filter(c => !['complete','cancelled'].includes(c.status) && (role === 'main' || c.owner === who)).map(c => ({ id: c.id, task: c.task, owner: c.owner, status: c.status, count: c.entries.length, rev: c.rev }));
     if (pending.length) view.claims = pending;
     const stamp = sha(view).slice(0, 24);
@@ -195,9 +272,11 @@ function context(ws, options) {
     const resolvedAlerts = previous ? previous.alerts.filter(a => !view.alerts.some(n => sha(n) === sha(a))) : [];
     const claims = previous ? changed(view.claims || [], previous.claims || [], c => c.id) : view.claims || [];
     const resolvedClaims = previous ? (previous.claims || []).filter(c => !(view.claims || []).some(n => n.id === c.id)).map(c => c.id) : [];
+    const unregisteredDelta = previous ? changed(view.unregistered || [], previous.unregistered || [], u => u.path) : view.unregistered || [];
+    const registeredDirs = previous ? (previous.unregistered || []).filter(u => !(view.unregistered || []).some(n => n.path === u.path)).map(u => u.path) : [];
     history = [{ stamp, view }, ...history.filter(h => h.stamp !== stamp)].slice(0, 2);
     atomic(cache, history);
-    return { stamp, role, epoch: view.epoch, mode: previous ? 'delta' : 'snapshot', ...(options.since && !previous ? { reset: true } : {}), scope: 'declared-metadata', taskCount: view.tasks.length, alertCount: view.alerts.length, tasks: page(tasks, options), alerts: page(alerts, options), removedTasks: page(removedTasks, options), resolvedAlerts: page(resolvedAlerts, options), ...(pending.length || resolvedClaims.length ? { claims: page(claims,options), resolvedClaims: page(resolvedClaims,options) } : {}) };
+    return { stamp, role, epoch: view.epoch, mode: previous ? 'delta' : 'snapshot', ...(options.since && !previous ? { reset: true } : {}), scope: 'declared-metadata', taskCount: view.tasks.length, alertCount: view.alerts.length, tasks: page(tasks, options), alerts: page(alerts, options), removedTasks: page(removedTasks, options), resolvedAlerts: page(resolvedAlerts, options), ...(view.unregistered ? { unregisteredCount: view.unregistered.length, unregistered: page(unregisteredDelta, options), ...(registeredDirs.length ? { registeredDirectories: page(registeredDirs, options) } : {}) } : {}), ...(pending.length || resolvedClaims.length ? { claims: page(claims,options), resolvedClaims: page(resolvedClaims,options) } : {}) };
   });
 }
 function register(ws, options) {

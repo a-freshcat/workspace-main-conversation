@@ -1,15 +1,21 @@
-# workspace-main-conversation v2.1
+# workspace-main-conversation v2.2
 
 一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) / Codex skill：
 **让共享工作区里的多个对话不再各干各的、互相撞车。**
 
 无需 npm 包，不调用模型或 API，核心协作只用 Node 基础内置模块。
 
+> **v2.2 起**：`context` 会报告 `unregistered`——工作区里带 `.session-id` 归属标记
+> 却没登记任务的目录。此前这类对话对统筹完全不可见（`tasks: 0` 和"什么都没干"
+> 长得一模一样），实测有三个对话因此各建了几十个文件却无人知晓。
+> 变更细节见 [re_note.md](re_note.md)。
+
 ## 它解决什么问题
 
 一个工作区常被**多个对话同时**使用。没有约束时会出现：
 
 - 3 条对话、5 个目录 —— 多出来的那个**没人认领**，谁也不敢删
+- 子对话建了目录却**没登记**，主对话的简报里看不见，直到有人手工 `ls`
 - 两个对话做同一件事，产出重复
 - 一个对话改了另一个正在编辑的文件
 - 主对话不知道别人在干什么，无法判断该不该动手
@@ -82,6 +88,9 @@ node "$sk\audit-owners.mjs" $ws
 ## 用法要点
 
 - **进入已启用的工作区**：先跑 `context` 取简报；同一对话后续传上次的 `--since`，只读变化。
+- **看到 `unregistered` 就登记**：`context` 报出 `unregistered` 时，其中 `owner` 等于本会话的
+  目录就是本对话的产物——**先 `task` 登记再继续干活**。不登记主对话就看不见你，
+  冲突审查也无从谈起。主对话看到的是全部未登记归属，但**不能替子对话登记**。
 - **主对话**：统筹登记任务、处理 alerts、审查冲突与重复劳动；阶段结束用 `summary` 生成 `sum.md`。
 - **子对话**：只维护自己的任务记录和产物，需要上下文时优先 `detail --task ID`。
 - **共享写入前**先登记 `writes`；认领冲突则串行交接。

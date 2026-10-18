@@ -1,4 +1,4 @@
-# workspace-main-conversation v2.2.1
+# workspace-main-conversation v2.3.0
 
 一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) / Codex skill：
 **让共享工作区里的多个对话不再各干各的、互相撞车。**
@@ -11,6 +11,7 @@
 > 却没登记任务的目录。此前这类对话对统筹完全不可见（`tasks: 0` 和"什么都没干"
 > 长得一模一样），可能让已有产物的对话仍未进入统筹视图。
 > 变更细节见 [re_note.md](re_note.md)。
+> **v2.3.0 起**：主对话可核实未完成任务所属会话的记录线索，并在用户确认后取消或转交遗留任务；记录缺失不会自动判定会话已删除。
 
 ## 它解决什么问题
 
@@ -64,7 +65,7 @@ git clone https://github.com/a-freshcat/workspace-main-conversation.git ~/.dsh/s
 
 ```powershell
 node "$env:USERPROFILE\.dsh\skills\workspace-main-conversation\selftest-portable.mjs"
-# {"ok":true,"coordination":"passed","multiFrameDecode":"passed"}
+# {"ok":true,"coordination":"passed","taskRecovery":"passed","multiFrameDecode":"passed"}
 ```
 
 然后**重启 DSH**，技能列表才会出现它。

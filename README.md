@@ -1,10 +1,13 @@
-# workspace-main-conversation v2.2
+# workspace-main-conversation v2.2.1
 
 一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) / Codex skill：
 **让共享工作区里的多个对话不再各干各的、互相撞车。**
 
 无需 npm 包，不调用模型或 API，核心协作只用 Node 基础内置模块。
 
+> **v2.2.1 起**：`role=unknown` 会带 `identity` 说明自己没拿到会话身份，
+> 不再伪装成 `taskCount: 0` 的正常结果；CLI 也会用 `DSH_SESSION_ID` 兜底。
+> 起因是子对话用 bash 查 `env` 拿不到 id，按规则填 `unknown` 后空转半小时。
 > **v2.2 起**：`context` 会报告 `unregistered`——工作区里带 `.session-id` 归属标记
 > 却没登记任务的目录。此前这类对话对统筹完全不可见（`tasks: 0` 和"什么都没干"
 > 长得一模一样），实测有三个对话因此各建了几十个文件却无人知晓。
@@ -88,6 +91,11 @@ node "$sk\audit-owners.mjs" $ws
 ## 用法要点
 
 - **进入已启用的工作区**：先跑 `context` 取简报；同一对话后续传上次的 `--since`，只读变化。
+- **取会话 id 用 `pwsh`**：`pwsh` 里有 `DSH_SESSION_ID`，`ops_bash`/bash 里没有任何 `DSH_*`。
+  在 bash 里跑 `env` 找不到 id 是执行器差异，不代表你不在会话里。CLI 会自动用
+  `DSH_SESSION_ID` 兜底（所有需要身份的命令都生效），显式 `--session` 优先。
+  仍取不到时 `role=unknown` 并带 `identity.status=unknown`——**那不代表你没有任务**，
+  此时什么都登记不了，先在 `pwsh` 重跑或问用户，不要翻日志猜。
 - **看到 `unregistered` 就登记**：`context` 报出 `unregistered` 时，其中 `owner` 等于本会话的
   目录就是本对话的产物——**先 `task` 登记再继续干活**。不登记主对话就看不见你，
   冲突审查也无从谈起。主对话看到的是全部未登记归属，但**不能替子对话登记**。
@@ -151,11 +159,11 @@ node "$sk\zstd-frames.mjs" "<某个 session.v4.jsonl.zstd>"
 
 ```powershell
 $tests = (Get-ChildItem tests -Filter '*.test.mjs').FullName
-node --test $tests                # 70 项；链接权限受限时 2 项有原因地跳过
+node --test $tests                # 73 项；链接权限受限时 2 项有原因地跳过
 node selftest-portable.mjs        # 期望 {"ok":true,...}
 ```
 
-测试集合共 70 项。两个链接防护测试只有在 Windows 创建 junction 返回 `EPERM` 或 `EACCES` 时才标为 `SKIP`；其他错误仍会失败。跳过表示该环境没有执行链接防护断言，应在允许创建 junction 的环境重跑，不能记为通过。
+测试集合共 73 项。两个链接防护测试只有在 Windows 创建 junction 返回 `EPERM` 或 `EACCES` 时才标为 `SKIP`；其他错误仍会失败。跳过表示该环境没有执行链接防护断言，应在允许创建 junction 的环境重跑，不能记为通过。
 已在 Node v24.21.0 验证；zstd 功能需当前 Node 提供相应 API。
 
 ## 安全边界

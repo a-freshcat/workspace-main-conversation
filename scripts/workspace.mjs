@@ -17,6 +17,20 @@ function text(value, name, max = 400) {
   if (typeof value !== 'string' || value.length > max || /[\u0000-\u001f]/u.test(value)) fail('INVALID', `${name} must be single-line text, max ${max}`);
   return value;
 }
+// The only authoritative source for "which conversation am I" is the variable
+// the DSH runtime exports into its shell. It is NOT visible to every executor:
+// `pwsh` receives it, `ops_bash` does not (the bash IPC layer is handed a bare
+// PATH). So a caller that probed `env` from bash sees nothing and is tempted to
+// pass `unknown` — which is exactly the state this fallback removes. Reading it
+// here means the id still resolves when the caller forgot to pass one, instead
+// of relying on the conversation to know which tool exposes it.
+const ENV_SESSION = 'DSH_SESSION_ID';
+function envSession(env) {
+  const value = env?.[ENV_SESSION];
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return /^[\x21-\x7e]{1,160}$/.test(trimmed) ? trimmed : undefined;
+}
 function session(value, modifying = false) {
   text(value, 'session', 160);
   if (!value || (modifying && value === 'unknown')) fail('IDENTITY_UNKNOWN', 'Use the actual session id for mutations');
@@ -240,6 +254,16 @@ function page(items, options) {
 }
 const portable = (ws, p) => inside(canonical(ws, '.'), p) ? path.relative(canonical(ws, '.'), p).split(path.sep).join('/') : p;
 function brief(ws, t) { return { id: t.id, owner: t.owner, rev: t.rev, state: t.state, goal: t.goal, directory: portable(ws, t.directory), next: t.next, ...(t.result ? { result: t.result } : {}) }; }
+// A role of `unknown` used to render as `taskCount: 0`, which is byte-identical
+// to "this conversation has nothing registered" — so a child that could not
+// read its id saw a clean bill of health and did nothing. The state is not
+// normal, and the output now says so where the caller is already looking.
+const IDENTITY_HINT = 'Pass the session id explicitly, or pick it up automatically by running this command under pwsh, where the DSH runtime exports DSH_SESSION_ID ($env:DSH_SESSION_ID). ops_bash/bash receives no DSH_* variables, so `env` there shows nothing. Until the id is known this view cannot tell your tasks from another conversation\'s, and nothing may be registered or claimed.';
+function identity(who) {
+  return who === 'unknown'
+    ? { status: 'unknown', hint: IDENTITY_HINT }
+    : { status: 'resolved' };
+}
 function context(ws, options) {
   const who = session(options.session ?? 'unknown');
   if (!config(ws)) return { schema: SCHEMA, role: 'unknown', enabled: false, legacy: present(path.join(ws, 'sum.md')) || present(path.join(ws, 'main.md')), action: 'Continue the user task; init requires an explicit coordinator assignment' };
@@ -276,7 +300,7 @@ function context(ws, options) {
     const registeredDirs = previous ? (previous.unregistered || []).filter(u => !(view.unregistered || []).some(n => n.path === u.path)).map(u => u.path) : [];
     history = [{ stamp, view }, ...history.filter(h => h.stamp !== stamp)].slice(0, 2);
     atomic(cache, history);
-    return { stamp, role, epoch: view.epoch, mode: previous ? 'delta' : 'snapshot', ...(options.since && !previous ? { reset: true } : {}), scope: 'declared-metadata', taskCount: view.tasks.length, alertCount: view.alerts.length, tasks: page(tasks, options), alerts: page(alerts, options), removedTasks: page(removedTasks, options), resolvedAlerts: page(resolvedAlerts, options), ...(view.unregistered ? { unregisteredCount: view.unregistered.length, unregistered: page(unregisteredDelta, options), ...(registeredDirs.length ? { registeredDirectories: page(registeredDirs, options) } : {}) } : {}), ...(pending.length || resolvedClaims.length ? { claims: page(claims,options), resolvedClaims: page(resolvedClaims,options) } : {}) };
+    return { stamp, role, epoch: view.epoch, mode: previous ? 'delta' : 'snapshot', ...(options.since && !previous ? { reset: true } : {}), scope: 'declared-metadata', ...(role === 'unknown' ? { identity: identity(who) } : {}), taskCount: view.tasks.length, alertCount: view.alerts.length, tasks: page(tasks, options), alerts: page(alerts, options), removedTasks: page(removedTasks, options), resolvedAlerts: page(resolvedAlerts, options), ...(view.unregistered ? { unregisteredCount: view.unregistered.length, unregistered: page(unregisteredDelta, options), ...(registeredDirs.length ? { registeredDirectories: page(registeredDirs, options) } : {}) } : {}), ...(pending.length || resolvedClaims.length ? { claims: page(claims,options), resolvedClaims: page(resolvedClaims,options) } : {}) };
   });
 }
 function register(ws, options) {
@@ -440,10 +464,21 @@ function parse(argv) {
   }
   return { command, options };
 }
-export function execute(argv) {
+export function execute(argv, env) {
   if (!argv.length || argv[0] === '--help') return { help: HELP };
   const { command, options } = parse(argv);
   if (!options.workspace) fail('INVALID', '--workspace is required');
+  // The environment is only consulted by the CLI entry point, never by the
+  // exported function: an in-process caller (the test suite) must not inherit
+  // whatever conversation happened to launch it.
+  //
+  // The fallback covers every command that needs an identity, not just
+  // `context`: a child that learns `role=child` but still has no id to pass
+  // would be told its tasks exist and then be unable to register or claim them.
+  if (!options.session) {
+    const fromEnv = envSession(env);
+    if (fromEnv) options.session = fromEnv;
+  }
   const ws = fs.realpathSync(path.resolve(options.workspace));
   if (!fs.statSync(ws).isDirectory()) fail('INVALID', 'Workspace must be an existing directory');
   switch (command) {
@@ -466,7 +501,7 @@ export function execute(argv) {
 }
 export function cli(argv = process.argv.slice(2)) {
   try {
-    const result = execute(argv);
+    const result = execute(argv, process.env);
     console.log(JSON.stringify(result));
     process.exitCode = result.ok === false ? 1 : 0;
   } catch (e) {

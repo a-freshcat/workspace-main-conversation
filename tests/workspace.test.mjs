@@ -295,3 +295,58 @@ test('a claim is reported once, not per file, and excluded roots stay excluded',
   assert.equal(seen.unregisteredCount, 1);
   assert.equal(seen.unregistered.items[0].files, 6); // marker + 5 nested files
 });
+// A child that could not read its own id used to see `taskCount: 0` — the same
+// bytes as a conversation with nothing to do — so it correctly did nothing and
+// the work stayed invisible. The state must announce itself.
+test('an unresolved identity is reported as a problem, not as an empty clean view', () => {
+  const ws = workspace();
+  const anon = run(ws, 'context');
+  assert.equal(anon.role, 'unknown');
+  assert.equal(anon.identity.status, 'unknown');
+  assert.match(anon.identity.hint, /DSH_SESSION_ID/);
+  assert.match(anon.identity.hint, /pwsh/);
+  // A resolved conversation carries no identity block at all: the field marks
+  // the broken case, so its presence is the signal.
+  assert.equal(run(ws, 'context', { session: 'child-a' }).identity, undefined);
+  assert.equal(run(ws, 'context', { session: 'main' }).identity, undefined);
+});
+test('the runtime session variable is used by the CLI, and never by in-process callers', () => {
+  const ws = workspace();
+  run(ws, 'task', { session: 'child-a', file: (() => {
+    const p = path.join(suite, `input-${++sequence}.json`);
+    fs.writeFileSync(p, JSON.stringify({ id: 'task-a', goal: '修复导出', state: 'doing', directory: 'conversations/task-a', writes: [], next: '验证结果' }));
+    return p;
+  })() });
+  const cli = (...extra) => {
+    const args = ['scripts/workspace.mjs', 'context', '--workspace', ws, ...extra];
+    return spawnSync(process.execPath, args, {
+      cwd: pkg, encoding: 'utf8',
+      env: { ...process.env, DSH_SESSION_ID: 'child-a' },
+    });
+  };
+  // With no --session the CLI falls back to the exported runtime variable.
+  assert.equal(JSON.parse(cli().stdout).role, 'child');
+  // An explicit id still wins.
+  assert.equal(JSON.parse(cli('--session', 'main').stdout).role, 'main');
+  // The exported function ignores the ambient environment entirely: the test
+  // suite runs under pwsh, where DSH_SESSION_ID names the real conversation.
+  assert.equal(execute(['context', '--workspace', ws]).role, 'unknown');
+});
+// Knowing `role=child` without knowing the id is still useless: the same
+// conversation must then be able to register and claim. The fallback therefore
+// applies to every identity-taking command, not to `context` alone.
+test('the session fallback also reaches mutating commands', () => {
+  const ws = workspace();
+  const input = path.join(suite, `input-${++sequence}.json`);
+  fs.writeFileSync(input, JSON.stringify({ id: 'task-env', goal: '修复导出', state: 'doing', directory: 'conversations/task-env', writes: [], next: '验证结果' }));
+  const run = (...args) => spawnSync(process.execPath, ['scripts/workspace.mjs', ...args], {
+    cwd: pkg, encoding: 'utf8', env: { ...process.env, DSH_SESSION_ID: 'child-env' },
+  });
+  const registered = run('task', '--workspace', ws, '--file', input);
+  assert.equal(registered.status, 0, registered.stderr);
+  assert.equal(JSON.parse(registered.stdout).id, 'task-env');
+  // The task is owned by the id from the environment, not by `unknown`.
+  const seen = JSON.parse(run('context', '--workspace', ws, '--session', 'child-env').stdout);
+  assert.equal(seen.taskCount, 1);
+  assert.equal(seen.tasks.items[0].id, 'task-env');
+});

@@ -40,6 +40,8 @@ state 可选 `planned/doing/blocked/done/cancelled`。前三者保留资源认�
 
 `unregistered` 是登记表之外的另一条线索：工作区里带 `.session-id` 归属标记、却不属于任何登记任务的目录。每项给出 `path`（相对工作区）、`owner`（标记里写的会话）、`files`（该目录下普通文件数）。main 看到全部，child 只看到 `owner` 等于自己的那些；没有内容时整个字段省略。判据是归属标记而不是目录存在，因此 `src/`、`docs/` 这类普通目录和没有标记的目录永不被报告；挂载点、链接和 `.git/.workspace/node_modules/.venv/venv/dist/build/__pycache__` 不参与。扫描上限为深度 4、50 个目录、每目录 5000 文件，达到上限时结果不完整，不能当作"没有更多"。该字段只读，登记任务后对应目录自然消失；它不替代 `check` 的文件内容比对。
 
+`identity` 只在 `role=unknown` 时出现，形如 `{"status":"unknown","hint":"…"}`。它说明本次调用没能确定会话身份：此时 `taskCount: 0` 不代表你没有任务，任何登记和认领都会失败。取 id 的可靠来源是 `pwsh` 的 `DSH_SESSION_ID`；`ops_bash`/bash 不传任何 `DSH_*` 变量，在那里 `env` 查不到。CLI 在缺少 `--session` 时用 `DSH_SESSION_ID` 兜底，对所有需要身份的命令生效（`context`、`task`、`summary`、`init`、`handoff`），显式 `--session` 优先；导出的 `execute()` 不读环境，只有 CLI 入口读。
+
 `owners` 只验证登记产物的显式归属标记，不扫描文件正文。`check` 递归检查登记产物和 writes，比较内容哈希与上次 summary 的扫描快照，检测新增/修改/删除；根目录共享文件须在 writes 里登记。默认每组 5 项，可用 limit/offset 分页。扫描不跟随符号链接，跳过 `.git/.workspace/node_modules/.venv/venv/dist/build/__pycache__`，这些目录若被直接登记为资源仍扫描根目录本身。上限为 5000 文件、20000 路径、单文件 16 MiB、合计 64 MiB；达到上限、读取错误、链接或扫描期间变更都明确标为 incomplete，不能给出无冲突保证。
 
 首次没有扫描基线会提示 baseline_missing；主对话检查后用 summary 建立基线。summary 保存的是内容哈希，不靠 mtime 判断，内容相同不会反复重写。只生成 v2 维护的 sum.md；遇到手工/v1 文件保留原件并拒绝覆盖。

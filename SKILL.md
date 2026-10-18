@@ -3,7 +3,7 @@ name: workspace-main-conversation
 description: 管理共享工作区的对话分工、文件归属与认领归拢；进入已启用的工作区、共享写入或整理散落产物时使用。
 ---
 
-# 工作区协作 v2.2
+# 工作区协作 v2.2.1
 
 目标：用少量状态支持协作，细节按需读取。具体任务分工以用户指派为准。脚本路径相对本 skill 目录；工作区参数用绝对路径。适用于 Codex 和 DSH。
 
@@ -14,6 +14,13 @@ SESSION 使用运行环境给出的当前对话 id；不可获取时保留 unkno
 未启用时继续用户原任务；只有用户明确指定主对话并启用管理时才执行 `init`。
 新上下文先取完整简报；同一上下文后续传上次完整处理过的 `--since STAMP`，只读变化。
 `scope=declared-metadata` 只检查登记信息；它不证明源文件未变。
+
+**取 SESSION：`pwsh` 里有 `DSH_SESSION_ID`，`ops_bash`/bash 里没有任何 `DSH_*`。**
+用 bash 跑 `env` 找 id 一定是空的——那是执行器的差异，不是你不在会话里。
+CLI 会自己读 `DSH_SESSION_ID` 兜底，所以在 `pwsh` 下不传 `--session` 也能识别身份。
+仍取不到时 `role=unknown`，输出会带 `identity.status=unknown` 与原因，**不要把它当正常结果**：
+此时什么都登记不了，也不要为了拿到 id 去翻会话日志或猜。先在 `pwsh` 下重跑一次、
+或让用户把 id 告诉你，再继续。
 
 ## 执行
 

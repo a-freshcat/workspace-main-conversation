@@ -154,8 +154,8 @@ function alertsFor(tasks, claims = []) {
  * The marker is the skill's own claim of authorship (`task` writes it when it
  * adopts a directory), so a marked-but-unregistered directory is a conversation
  * that has written into this workspace WITHOUT registering — the exact blind spot
- * that let three sibling conversations build 90+ files, invisible to the
- * coordinator, until someone ran `ls`. `context` alone could never surface them:
+ * that left unregistered work invisible to the coordinator until someone
+ * inspected the workspace manually. `context` alone could never surface it:
  * it reads the registry, and an unregistered conversation has no registry entry
  * to read.
  *

@@ -17,8 +17,8 @@ SESSION 使用运行环境给出的当前对话 id；不可获取时保留 unkno
 
 ## 执行
 
-- `role=main`：汇总登记任务，处理 alerts、审查冲突与重复劳动；阶段结束用 `summary` 生成 `sum.md`。
-- `role=child`：只维护自己的任务记录和产物；需要上下文时优先 `detail --task ID`。
+- `role=main`：默认负责统筹登记任务、审查冲突与重复劳动；阶段结束用 `summary` 生成 `sum.md`。具体执行任务听从使用者指派，不按 bug 大小预设分工。
+- `role=child`：按使用者指派执行任务，只维护自己的任务记录和产物；需要上下文时优先 `detail --task ID`。
 - 接任务、状态变化、结果交接时用 `task --file INPUT.json` 登记；字段和命令见 [命令参考](references/commands.md)。普通回复无需改台账。
 - 共享写入前先登记 `writes`；认领冲突则串行交接。`check` 核对已登记路径，编辑前重读目标文件。
 - `sum.md` 由主对话脚本生成；子对话更新各自记录。相同内容不增加任务版本。

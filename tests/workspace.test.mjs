@@ -175,9 +175,16 @@ test('corrupted disposable cache falls back to a full snapshot', () => {
   task(ws);
   assert.equal(run(ws, 'context', { session: 'main', since: c.stamp }).reset, true);
 });
-test('symlink metadata cannot redirect writes', () => {
+test('symlink metadata cannot redirect writes', t => {
   const ws = workspace(false), target = path.join(suite, 'outside-' + ++sequence); fs.mkdirSync(target);
-  fs.symlinkSync(target, path.join(ws, '.workspace'), process.platform === 'win32' ? 'junction' : 'dir');
+  try { fs.symlinkSync(target, path.join(ws, '.workspace'), process.platform === 'win32' ? 'junction' : 'dir'); }
+  catch (error) {
+    if (process.platform === 'win32' && ['EPERM', 'EACCES'].includes(error.code)) {
+      t.skip(`Windows denied junction creation (${error.code})`);
+      return;
+    }
+    throw error;
+  }
   throwsCode(() => run(ws, 'init', { session: 'main' }), 'LINK');
   assert.deepEqual(fs.readdirSync(target), []);
 });
@@ -238,7 +245,7 @@ test('CLI decoding fails nonzero for malformed files, short valid sessions pass 
 // turning into "every directory is suspect".
 test('a marked but unregistered directory is reported to the coordinator', () => {
   const ws = workspace();
-  const dir = path.join(ws, 'conversation-2026-01-01-other-work');
+  const dir = path.join(ws, 'conversation-unregistered-example');
   fs.mkdirSync(dir);
   fs.writeFileSync(path.join(dir, '.session-id'), 'child-lost\n');
   fs.writeFileSync(path.join(dir, 'notes.md'), 'work');
@@ -246,7 +253,7 @@ test('a marked but unregistered directory is reported to the coordinator', () =>
   const seen = run(ws, 'context', { session: 'main' });
   assert.equal(seen.unregisteredCount, 1);
   const [claim] = seen.unregistered.items;
-  assert.equal(claim.path, 'conversation-2026-01-01-other-work');
+  assert.equal(claim.path, 'conversation-unregistered-example');
   assert.equal(claim.owner, 'child-lost');
   assert.equal(claim.files, 2); // .session-id + notes.md
 });

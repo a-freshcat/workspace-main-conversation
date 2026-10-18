@@ -14,7 +14,7 @@
 
 一个工作区常被**多个对话同时**使用。没有约束时会出现：
 
-- 3 条对话、5 个目录 —— 多出来的那个**没人认领**，谁也不敢删
+- 多个对话共享多个目录 —— 有目录**没人认领**，谁也不敢删
 - 子对话建了目录却**没登记**，主对话的简报里看不见，直到有人手工 `ls`
 - 两个对话做同一件事，产出重复
 - 一个对话改了另一个正在编辑的文件
@@ -91,8 +91,8 @@ node "$sk\audit-owners.mjs" $ws
 - **看到 `unregistered` 就登记**：`context` 报出 `unregistered` 时，其中 `owner` 等于本会话的
   目录就是本对话的产物——**先 `task` 登记再继续干活**。不登记主对话就看不见你，
   冲突审查也无从谈起。主对话看到的是全部未登记归属，但**不能替子对话登记**。
-- **主对话**：统筹登记任务、处理 alerts、审查冲突与重复劳动；阶段结束用 `summary` 生成 `sum.md`。
-- **子对话**：只维护自己的任务记录和产物，需要上下文时优先 `detail --task ID`。
+- **主对话**：默认统筹登记任务、处理 alerts、审查冲突与重复劳动；阶段结束用 `summary` 生成 `sum.md`。具体执行任务听从使用者指派，不预设按 bug 大小分工。
+- **子对话**：按使用者指派执行任务，只维护自己的任务记录和产物；需要上下文时优先 `detail --task ID`。
 - **共享写入前**先登记 `writes`；认领冲突则串行交接。
 - 详细命令见 [references/commands.md](references/commands.md)；
   整理散落产物见 [references/organize.md](references/organize.md)；
@@ -119,14 +119,13 @@ node "$sk\audit-owners.mjs" $ws
 
 DSH 的会话记录是 `session.v4.jsonl.zstd`，**多帧 zstd**。
 
-用 `zstdDecompressSync` 整段解**只出第一帧** —— 实测一个 1082 帧的文件只解出 249 字符。
-于是会得出「这个对话什么都没写」的**错误结论**。
+用 `zstdDecompressSync` 整段解可能只处理第一帧，导致把不完整结果误认为完整内容。
 
-自带解码器按 zstd 帧结构逐帧解，实测 1082 帧全解、488 万字符。
+自带解码器按 zstd 帧结构逐帧解，并单独报告成功与失败的帧数。
 
 ```powershell
 node "$sk\zstd-frames.mjs" "<某个 session.v4.jsonl.zstd>"
-# frames=1082 ok=1082 failed=0 chars=4887590
+# frames=<total> ok=<decoded> failed=<failed> chars=<characters>
 ```
 
 ## 设计取舍
@@ -151,17 +150,13 @@ node "$sk\zstd-frames.mjs" "<某个 session.v4.jsonl.zstd>"
 ## 测试
 
 ```powershell
-node --test tests/*.test.mjs      # 期望 66 pass
+$tests = (Get-ChildItem tests -Filter '*.test.mjs').FullName
+node --test $tests                # 70 项；链接权限受限时 2 项有原因地跳过
 node selftest-portable.mjs        # 期望 {"ok":true,...}
 ```
 
-须展开成文件列表；Node 24 下 `node --test tests/` 目录形式会报 `Cannot find module`。
+测试集合共 70 项。两个链接防护测试只有在 Windows 创建 junction 返回 `EPERM` 或 `EACCES` 时才标为 `SKIP`；其他错误仍会失败。跳过表示该环境没有执行链接防护断言，应在允许创建 junction 的环境重跑，不能记为通过。
 已在 Node v24.21.0 验证；zstd 功能需当前 Node 提供相应 API。
-
-部分用例依赖子进程（`git`、`rg`）和真实链接；在禁止管道 spawn 或会把 junction
-虚拟化成普通目录的受限沙箱里，`concurrent init`、`CLI decoding` 与 symlink 相关用例
-会假报失败，`organize` 还会因 Git 状态判定为 unknown 而集体返回 `PROJECT_FILE`。
-这是环境限制，不是回归——换到普通终端复跑即可。
 
 ## 安全边界
 

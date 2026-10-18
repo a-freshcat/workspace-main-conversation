@@ -109,9 +109,10 @@ test('Git-tracked files require project-level migration',()=>{
   const ws=setup();assert.equal(spawnSync('git',['init','-q',ws]).status,0);assert.equal(spawnSync('git',['-C',ws,'add','notes.md']).status,0);
   failCode(()=>plan(ws),'PROJECT_FILE');assert.equal(fs.existsSync(path.join(ws,'notes.md')),true);
 });
-test('target junction cannot escape the registered owner directory',()=>{
+test('target junction cannot escape the registered owner directory',t=>{
   const ws=setup(),outside=path.join(suite,'outside-'+ ++seq);fs.mkdirSync(outside);
-  fs.symlinkSync(outside,path.join(ws,'conversations/collect/escape'),process.platform==='win32'?'junction':'dir');
+  try{fs.symlinkSync(outside,path.join(ws,'conversations/collect/escape'),process.platform==='win32'?'junction':'dir');}
+  catch(error){if(process.platform==='win32'&&['EPERM','EACCES'].includes(error.code)){t.skip(`Windows denied junction creation (${error.code})`);return;}throw error;}
   failCode(()=>plan(ws,[{source:'notes.md',target:'escape/notes.md'}]),'LINK');assert.deepEqual(fs.readdirSync(outside),[]);
 });
 test('pending plan reserves sources against other plans and tasks',()=>{

@@ -17,6 +17,17 @@ try {
   run('summary', '--session', 'smoke-main');
   assert.equal(run('check').ok, true);
   assert.equal(executeOrganize(['inventory','--workspace',root]).enabled,true);
+  const input = path.join(root, 'smoke-task.json');
+  fs.writeFileSync(input, JSON.stringify({ id: 'smoke-task', goal: 'Portable recovery check', state: 'doing', directory: 'conversations/smoke-task', writes: [], next: 'verify' }));
+  run('task', '--session', 'smoke-old', '--file', input);
+  const home = path.join(root, 'smoke-dsh'); fs.mkdirSync(path.join(home, 'sessions'), { recursive: true });
+  const presence = run('session-check', '--session', 'smoke-main', '--sessions-home', home);
+  assert.equal(presence.owners.items[0].status, 'record_missing');
+  const recovered = run('recover-task', '--session', 'smoke-main', '--task', 'smoke-task', '--from', 'smoke-old', '--expect-rev', '1', '--action', 'reassign', '--to', 'smoke-new', '--confirm-unavailable', '--reason', 'Synthetic smoke test confirmation');
+  assert.equal(recovered.owner, 'smoke-new');
+  assert.equal(run('owners').ok, true);
+  run('summary', '--session', 'smoke-main');
+  assert.equal(run('check').ok, true);
   let decoding = 'unavailable';
   if (typeof zlib.zstdCompressSync === 'function') {
     const sample = path.join(root, 'sample.zstd');
@@ -25,7 +36,7 @@ try {
     decoding = 'passed';
   }
   if (process.argv[2]) decodeAll(path.resolve(process.argv[2]));
-  console.log(JSON.stringify({ ok: true, coordination: 'passed', multiFrameDecode: decoding, ...(decoding === 'unavailable' ? { warning: 'Runtime lacks zstd; core collaboration works, log forensics unavailable' } : {}) }));
+  console.log(JSON.stringify({ ok: true, coordination: 'passed', taskRecovery: 'passed', multiFrameDecode: decoding, ...(decoding === 'unavailable' ? { warning: 'Runtime lacks zstd; core collaboration works, log forensics unavailable' } : {}) }));
 } catch (e) { console.error(JSON.stringify({ ok: false, message: e.message })); process.exitCode = 1; }
 finally {
   const target = path.resolve(root), base = path.resolve(os.tmpdir());

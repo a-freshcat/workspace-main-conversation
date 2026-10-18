@@ -7,10 +7,9 @@
 
 > **v2.2.1 起**：`role=unknown` 会带 `identity` 说明自己没拿到会话身份，
 > 不再伪装成 `taskCount: 0` 的正常结果；CLI 也会用 `DSH_SESSION_ID` 兜底。
-> 起因是子对话用 bash 查 `env` 拿不到 id，按规则填 `unknown` 后空转半小时。
 > **v2.2 起**：`context` 会报告 `unregistered`——工作区里带 `.session-id` 归属标记
 > 却没登记任务的目录。此前这类对话对统筹完全不可见（`tasks: 0` 和"什么都没干"
-> 长得一模一样），实测有三个对话因此各建了几十个文件却无人知晓。
+> 长得一模一样），可能让已有产物的对话仍未进入统筹视图。
 > 变更细节见 [re_note.md](re_note.md)。
 
 ## 它解决什么问题
@@ -94,7 +93,7 @@ node "$sk\audit-owners.mjs" $ws
 - **取会话 id 用 `pwsh`**：`pwsh` 里有 `DSH_SESSION_ID`，`ops_bash`/bash 里没有任何 `DSH_*`。
   在 bash 里跑 `env` 找不到 id 是执行器差异，不代表你不在会话里。CLI 会自动用
   `DSH_SESSION_ID` 兜底（所有需要身份的命令都生效），显式 `--session` 优先。
-  仍取不到时 `role=unknown` 并带 `identity.status=unknown`——**那不代表你没有任务**，
+  已启用的工作区仍取不到时 `role=unknown` 并带 `identity.status=unknown`——**那不代表你没有任务**，
   此时什么都登记不了，先在 `pwsh` 重跑或问用户，不要翻日志猜。
 - **看到 `unregistered` 就登记**：`context` 报出 `unregistered` 时，其中 `owner` 等于本会话的
   目录就是本对话的产物——**先 `task` 登记再继续干活**。不登记主对话就看不见你，
@@ -102,6 +101,7 @@ node "$sk\audit-owners.mjs" $ws
 - **主对话**：默认统筹登记任务、处理 alerts、审查冲突与重复劳动；阶段结束用 `summary` 生成 `sum.md`。具体执行任务听从使用者指派，不预设按 bug 大小分工。
 - **子对话**：按使用者指派执行任务，只维护自己的任务记录和产物；需要上下文时优先 `detail --task ID`。
 - **共享写入前**先登记 `writes`；认领冲突则串行交接。
+- **子对话被删或不可恢复**：主对话先核实，再按用户指派取消或转交遗留任务；会话记录检查只给线索。见 [会话检查与任务恢复](references/recovery.md)。
 - 详细命令见 [references/commands.md](references/commands.md)；
   整理散落产物见 [references/organize.md](references/organize.md)；
   DSH 日志取证见 [references/forensics.md](references/forensics.md)；
@@ -116,6 +116,7 @@ node "$sk\audit-owners.mjs" $ws
 | `SKILL.md` | **主规则**（skill 本体，DSH 读的就是它） |
 | `install.ps1` | 安装脚本，含备份与 legacy 合并 |
 | `scripts/workspace.mjs` | 核心：任务登记、简报、检查、汇总 |
+| `scripts/session-records.mjs` | 有上限的 DSH 会话记录存在性检查，不读取正文 |
 | `scripts/organize.mjs` | 认领与归拢：inventory / propose / accept / copy / finish |
 | `scripts/forensics/` | DSH 会话日志取证（list-sessions / peek-session） |
 | `check.mjs` / `audit-owners.mjs` | 根目录快捷入口，转发到 `scripts/workspace.mjs` |
@@ -159,11 +160,11 @@ node "$sk\zstd-frames.mjs" "<某个 session.v4.jsonl.zstd>"
 
 ```powershell
 $tests = (Get-ChildItem tests -Filter '*.test.mjs').FullName
-node --test $tests                # 73 项；链接权限受限时 2 项有原因地跳过
+node --test $tests                # 96 项；链接权限受限时 2 项有原因地跳过
 node selftest-portable.mjs        # 期望 {"ok":true,...}
 ```
 
-测试集合共 73 项。两个链接防护测试只有在 Windows 创建 junction 返回 `EPERM` 或 `EACCES` 时才标为 `SKIP`；其他错误仍会失败。跳过表示该环境没有执行链接防护断言，应在允许创建 junction 的环境重跑，不能记为通过。
+测试集合共 96 项。两个链接防护测试只有在 Windows 创建 junction 返回 `EPERM` 或 `EACCES` 时才标为 `SKIP`；其他错误仍会失败。跳过表示该环境没有执行链接防护断言，应在允许创建 junction 的环境重跑，不能记为通过。
 已在 Node v24.21.0 验证；zstd 功能需当前 Node 提供相应 API。
 
 ## 安全边界

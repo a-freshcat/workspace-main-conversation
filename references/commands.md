@@ -13,6 +13,7 @@ node scripts/workspace.mjs check --workspace WORKSPACE
 node scripts/workspace.mjs owners --workspace WORKSPACE
 node scripts/workspace.mjs summary --workspace WORKSPACE --session SESSION
 node scripts/workspace.mjs handoff --workspace WORKSPACE --session SESSION --to NEW_SESSION --expect-epoch EPOCH
+node scripts/workspace.mjs session-check --workspace WORKSPACE --session MAIN_SESSION --sessions-home DSH_HOME
 ```
 
 `init` 只在用户要求启用管理并指定主对话时调用。已有 v1 的 `sum.md` / `main.md` 时额外传 `--ack-legacy`，先读迁移参考；不会导入或猜测旧 owner。
@@ -34,13 +35,17 @@ node scripts/workspace.mjs handoff --workspace WORKSPACE --session SESSION --to 
 
 state 可选 `planned/doing/blocked/done/cancelled`。前三者保留资源认领；完成/取消后释放。创建任务不传 expect-rev；更新必须传当前版本，其他对话不能覆盖。产物目录不可交叉，后续不可更换；已有未标记非空目录须用 `--adopt`，且须用户明确确认该目录归属。不要把代码库根或公共源码目录当成个人产物目录。
 
+子对话已删除或不可恢复时，用户确认后由主对话用 `recover-task` 取消或转交已登记任务；参数、记录源检查及中断续做见 [会话检查与任务恢复](recovery.md)。普通任务输入字段不变，恢复审计单独保存。
+
 `writes` 声明文件或目录，路径相对工作区，也接受明确的绝对路径（含工作区外资源）。脚本仅读取外部资源；所有实际编辑仍使用原工具与权限。目录前缀、大小写（Windows）、已存在的真实路径都参与重叠检查。认领仅协调**本工作区已登记且遵约的任务**，不提供跨工作区互斥或操作系统锁。
 
 `context` 默认每组最多 5 项，`--limit` 最大 20，`--offset` 分页。main 看到所有登记任务，child 看到自己的任务及相关冲突。摘要不含写入清单和全文证据，`detail` 按任务展开。新上下文不带 since；缓存丢失则返回 reset=true 的完整视图。缓存只保留每个会话最近两版，未处理完的分页不能把新 stamp 当成已读。
 
+主对话的 `sessionCheck` 说明会话记录是否检查；配置了 DSH 记录源时，scope 为 `declared-metadata+session-record-presence`。日志存在性不等于会话活跃性；核心导出函数只使用显式参数，不读取调用者环境。
+
 `unregistered` 是登记表之外的另一条线索：工作区里带 `.session-id` 归属标记、却不属于任何登记任务的目录。每项给出 `path`（相对工作区）、`owner`（标记里写的会话）、`files`（该目录下普通文件数）。main 看到全部，child 只看到 `owner` 等于自己的那些；没有内容时整个字段省略。判据是归属标记而不是目录存在，因此 `src/`、`docs/` 这类普通目录和没有标记的目录永不被报告；挂载点、链接和 `.git/.workspace/node_modules/.venv/venv/dist/build/__pycache__` 不参与。扫描上限为深度 4、50 个目录、每目录 5000 文件，达到上限时结果不完整，不能当作"没有更多"。该字段只读，登记任务后对应目录自然消失；它不替代 `check` 的文件内容比对。
 
-`identity` 只在 `role=unknown` 时出现，形如 `{"status":"unknown","hint":"…"}`。它说明本次调用没能确定会话身份：此时 `taskCount: 0` 不代表你没有任务，任何登记和认领都会失败。取 id 的可靠来源是 `pwsh` 的 `DSH_SESSION_ID`；`ops_bash`/bash 不传任何 `DSH_*` 变量，在那里 `env` 查不到。CLI 在缺少 `--session` 时用 `DSH_SESSION_ID` 兜底，对所有需要身份的命令生效（`context`、`task`、`summary`、`init`、`handoff`），显式 `--session` 优先；导出的 `execute()` 不读环境，只有 CLI 入口读。
+`identity` 在已启用工作区且 `role=unknown` 时出现，形如 `{"status":"unknown","hint":"…"}`。它说明本次调用没能确定会话身份：此时 `taskCount: 0` 不代表你没有任务，任何登记和认领都会失败。取 id 的可靠来源是 `pwsh` 的 `DSH_SESSION_ID`；`ops_bash`/bash 不传任何 `DSH_*` 变量，在那里 `env` 查不到。CLI 在缺少 `--session` 时用 `DSH_SESSION_ID` 兜底，对所有需要身份的核心命令生效，显式 `--session` 优先；导出的 `execute()` 不读环境，只有 CLI 入口读。
 
 `owners` 只验证登记产物的显式归属标记，不扫描文件正文。`check` 递归检查登记产物和 writes，比较内容哈希与上次 summary 的扫描快照，检测新增/修改/删除；根目录共享文件须在 writes 里登记。默认每组 5 项，可用 limit/offset 分页。扫描不跟随符号链接，跳过 `.git/.workspace/node_modules/.venv/venv/dist/build/__pycache__`，这些目录若被直接登记为资源仍扫描根目录本身。上限为 5000 文件、20000 路径、单文件 16 MiB、合计 64 MiB；达到上限、读取错误、链接或扫描期间变更都明确标为 incomplete，不能给出无冲突保证。
 

@@ -18,7 +18,7 @@ SESSION 使用运行环境给出的当前对话 id；不可获取时保留 unkno
 **取 SESSION：`pwsh` 里有 `DSH_SESSION_ID`，`ops_bash`/bash 里没有任何 `DSH_*`。**
 用 bash 跑 `env` 找 id 一定是空的——那是执行器的差异，不是你不在会话里。
 CLI 会自己读 `DSH_SESSION_ID` 兜底，所以在 `pwsh` 下不传 `--session` 也能识别身份。
-仍取不到时 `role=unknown`，输出会带 `identity.status=unknown` 与原因，**不要把它当正常结果**：
+已启用的工作区仍取不到时 `role=unknown`，输出会带 `identity.status=unknown` 与原因，**不要把它当正常结果**：
 此时什么都登记不了，也不要为了拿到 id 去翻会话日志或猜。先在 `pwsh` 下重跑一次、
 或让用户把 id 告诉你，再继续。
 
@@ -29,6 +29,7 @@ CLI 会自己读 `DSH_SESSION_ID` 兜底，所以在 `pwsh` 下不传 `--session
 - 接任务、状态变化、结果交接时用 `task --file INPUT.json` 登记；字段和命令见 [命令参考](references/commands.md)。普通回复无需改台账。
 - 共享写入前先登记 `writes`；认领冲突则串行交接。`check` 核对已登记路径，编辑前重读目标文件。
 - `sum.md` 由主对话脚本生成；子对话更新各自记录。相同内容不增加任务版本。
+- 主对话重新分派前看 `sessionCheck` 与 alerts；出现 `owner_record_missing`、用户告知子对话已删除，或需要接管遗留任务时，读 [会话检查与任务恢复](references/recovery.md)。记录缺失只提示核实；用户确认原 owner 不可用后，主对话才能取消或转交已登记任务。
 
 ## 看到 unregistered 就要处理
 

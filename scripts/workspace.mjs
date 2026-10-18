@@ -1,7 +1,9 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { sessionRecords } from './session-records.mjs';
 
 const META = '.workspace';
 const ACTIVE = new Set(['planned', 'doing', 'blocked']);
@@ -123,14 +125,18 @@ function readTasks(ws) {
   return entries.map(name => {
     const p = path.join(dir, name); noLink(p);
     if (fs.statSync(p).size > 128 * 1024) fail('REGISTRY_DAMAGED', `Task record too large: ${name}`);
-    const r = json(p);
-    const { rev, updatedAt, ...input } = r;
-    const { owner, ...body } = input;
-    session(owner, true);
-    const normalized = normalizeTask(ws, body, owner);
-    if (normalized.id + '.json' !== name || !Number.isSafeInteger(rev) || rev < 1 || !Number.isFinite(Date.parse(updatedAt))) fail('REGISTRY_DAMAGED', `Invalid task record: ${name}`);
-    return { ...normalized, rev, updatedAt };
+    const record = storedTask(ws, json(p));
+    if (record.id + '.json' !== name) fail('REGISTRY_DAMAGED', `Invalid task record: ${name}`);
+    return record;
   });
+}
+function storedTask(ws, r) {
+  if (!r || typeof r !== 'object' || Array.isArray(r)) fail('REGISTRY_DAMAGED', 'Invalid task record');
+  const { rev, updatedAt, owner, ...body } = r;
+  session(owner, true);
+  const normalized = normalizeTask(ws, body, owner);
+  if (!Number.isSafeInteger(rev) || rev < 1 || !Number.isFinite(Date.parse(updatedAt))) fail('REGISTRY_DAMAGED', 'Invalid task revision or timestamp');
+  return { ...normalized, rev, updatedAt };
 }
 function readClaims(ws) {
   const dir = path.join(metadata(ws), 'claims');
@@ -235,7 +241,8 @@ function countFilesShallow(dir) {
 }
 function snapshot(ws) {
   const c = needConfig(ws), tasks = readTasks(ws), claims = readClaims(ws);
-  return { config: c, tasks, claims, alerts: alertsFor(tasks, claims), unregistered: unregisteredDirectories(ws, tasks) };
+  const recovery = pendingRecovery(ws);
+  return { config: c, tasks, claims, recovery, alerts: [...alertsFor(tasks, claims), ...(recovery ? [{ type: 'recovery_pending', tasks: [recovery.task], recovery: recovery.id }] : [])], unregistered: unregisteredDirectories(ws, tasks) };
 }
 export function inspectWorkspace(workspace) {
   const ws = fs.realpathSync(path.resolve(workspace));
@@ -244,7 +251,7 @@ export function inspectWorkspace(workspace) {
 }
 export function coordinate(workspace, action) {
   const ws = fs.realpathSync(path.resolve(workspace));
-  return locked(ws, root => action({ workspace: ws, root, ...snapshot(ws) }));
+  return locked(ws, root => { const s = snapshot(ws); requireNoRecovery(s); return action({ workspace: ws, root, ...s }); });
 }
 function page(items, options) {
   const offset = Number(options.offset ?? 0), limit = Number(options.limit ?? 5);
@@ -264,6 +271,23 @@ function identity(who) {
     ? { status: 'unknown', hint: IDENTITY_HINT }
     : { status: 'resolved' };
 }
+function ownerRecords(s, options) {
+  const owners = [...new Set(s.tasks.filter(t => ACTIVE.has(t.state) && t.owner !== s.config.main).map(t => t.owner))];
+  if (!options['sessions-home']) return { status: 'not-configured', scope: 'session-record-presence', owners: [], issues: [] };
+  text(options['sessions-home'], 'sessions-home', 2048);
+  return sessionRecords(options['sessions-home'], owners);
+}
+function checkSessions(ws, options) {
+  const who = session(options.session, true);
+  needConfig(ws);
+  return locked(ws, () => {
+    const s = snapshot(ws);
+    if (s.config.main !== who) fail('NOT_MAIN', 'Only the current coordinator can inspect all task owners');
+    if (!options['sessions-home']) fail('SESSION_SOURCE_REQUIRED', 'Pass --sessions-home DSH_HOME; missing records are not proof of deletion');
+    const r = ownerRecords(s, options);
+    return { ...r, owners: page(r.owners.map(o => ({ ...o, tasks: s.tasks.filter(t => ACTIVE.has(t.state) && t.owner === o.owner).map(t => t.id) })), options), issues: page(r.issues, options) };
+  });
+}
 function context(ws, options) {
   const who = session(options.session ?? 'unknown');
   if (!config(ws)) return { schema: SCHEMA, role: 'unknown', enabled: false, legacy: present(path.join(ws, 'sum.md')) || present(path.join(ws, 'main.md')), action: 'Continue the user task; init requires an explicit coordinator assignment' };
@@ -272,6 +296,12 @@ function context(ws, options) {
     const ownIds = new Set(s.tasks.filter(t => t.owner === who).map(t => t.id));
     const ordered = s.tasks.filter(t => role === 'main' || ownIds.has(t.id)).sort((a, b) => Number(ACTIVE.has(b.state)) - Number(ACTIVE.has(a.state)) || a.id.localeCompare(b.id));
     const view = { epoch: s.config.epoch, role, tasks: ordered.map(t => brief(ws, t)), alerts: s.alerts.filter(a => role === 'main' || a.tasks.some(id => ownIds.has(id))) };
+    if (role === 'main' && s.tasks.some(t => ACTIVE.has(t.state) && t.owner !== who)) {
+      const { owners, issues, ...checked } = ownerRecords(s, options);
+      view.sessionCheck = checked;
+      for (const o of owners.filter(o => o.status === 'record_missing')) view.alerts.push({ type: 'owner_record_missing', owner: o.owner, tasks: s.tasks.filter(t => ACTIVE.has(t.state) && t.owner === o.owner).map(t => t.id) });
+      if (checked.complete === false) view.alerts.push({ type: 'session_check_incomplete', tasks: [], issues: issues.map(i => i.type) });
+    }
     // An unregistered claim is addressed to its OWN conversation: that child can
     // act on it (register, or say why the directory is not its business), and no
     // one else can. The coordinator sees all of them because chasing them down
@@ -281,7 +311,8 @@ function context(ws, options) {
     const pending = s.claims.filter(c => !['complete','cancelled'].includes(c.status) && (role === 'main' || c.owner === who)).map(c => ({ id: c.id, task: c.task, owner: c.owner, status: c.status, count: c.entries.length, rev: c.rev }));
     if (pending.length) view.claims = pending;
     const stamp = sha(view).slice(0, 24);
-    if (options.since === stamp) return { stamp, noChanges: true, scope: 'declared-metadata' };
+    const scope = view.sessionCheck?.scope === 'dsh-record-presence' ? 'declared-metadata+session-record-presence' : 'declared-metadata';
+    if (options.since === stamp) return { stamp, noChanges: true, scope };
     const cache = path.join(root, 'cache', sha(who) + '.json');
     let history = [];
     if (present(cache)) { noLink(cache); try {
@@ -300,7 +331,7 @@ function context(ws, options) {
     const registeredDirs = previous ? (previous.unregistered || []).filter(u => !(view.unregistered || []).some(n => n.path === u.path)).map(u => u.path) : [];
     history = [{ stamp, view }, ...history.filter(h => h.stamp !== stamp)].slice(0, 2);
     atomic(cache, history);
-    return { stamp, role, epoch: view.epoch, mode: previous ? 'delta' : 'snapshot', ...(options.since && !previous ? { reset: true } : {}), scope: 'declared-metadata', ...(role === 'unknown' ? { identity: identity(who) } : {}), taskCount: view.tasks.length, alertCount: view.alerts.length, tasks: page(tasks, options), alerts: page(alerts, options), removedTasks: page(removedTasks, options), resolvedAlerts: page(resolvedAlerts, options), ...(view.unregistered ? { unregisteredCount: view.unregistered.length, unregistered: page(unregisteredDelta, options), ...(registeredDirs.length ? { registeredDirectories: page(registeredDirs, options) } : {}) } : {}), ...(pending.length || resolvedClaims.length ? { claims: page(claims,options), resolvedClaims: page(resolvedClaims,options) } : {}) };
+    return { stamp, role, epoch: view.epoch, mode: previous ? 'delta' : 'snapshot', ...(options.since && !previous ? { reset: true } : {}), scope, ...(view.sessionCheck ? { sessionCheck: view.sessionCheck } : {}), ...(role === 'unknown' ? { identity: identity(who) } : {}), taskCount: view.tasks.length, alertCount: view.alerts.length, tasks: page(tasks, options), alerts: page(alerts, options), removedTasks: page(removedTasks, options), resolvedAlerts: page(resolvedAlerts, options), ...(view.unregistered ? { unregisteredCount: view.unregistered.length, unregistered: page(unregisteredDelta, options), ...(registeredDirs.length ? { registeredDirectories: page(registeredDirs, options) } : {}) } : {}), ...(pending.length || resolvedClaims.length ? { claims: page(claims,options), resolvedClaims: page(resolvedClaims,options) } : {}) };
   });
 }
 function register(ws, options) {
@@ -308,8 +339,8 @@ function register(ws, options) {
   if (!options.file) fail('INVALID', 'task requires --file');
   const input = json(path.resolve(options.file));
   return locked(ws, root => {
-    const s = snapshot(ws), current = normalizeTask(ws, input, who);
-    const old = s.tasks.find(t => t.id === current.id);
+    const s = snapshot(ws); requireNoRecovery(s);
+    const current = normalizeTask(ws, input, who), old = s.tasks.find(t => t.id === current.id);
     if (old && old.owner !== who) fail('OWNER_MISMATCH', 'Task belongs to another session');
     if (old && String(old.rev) !== options['expect-rev']) fail('REVISION_MISMATCH', 'Pass the latest --expect-rev', { actualRev: old.rev });
     if (!old && options['expect-rev'] !== undefined) fail('REVISION_MISMATCH', 'New task has no prior revision');
@@ -331,6 +362,128 @@ function register(ws, options) {
     const record = { ...current, rev: (old?.rev ?? 0) + 1, updatedAt: new Date().toISOString() };
     atomic(path.join(root, 'tasks', current.id + '.json'), record);
     return { id: record.id, rev: record.rev, state: record.state, directory: portable(ws, record.directory) };
+  });
+}
+
+function requireNoRecovery(s) {
+  if (s.recovery) fail('RECOVERY_PENDING', 'Resume the pending task recovery before changing workspace records', { recovery: s.recovery.id });
+}
+function recoveryId(value) {
+  if (typeof value !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}-r[1-9][0-9]{0,15}$/.test(value)) fail('INVALID', 'Invalid recovery id');
+  return value;
+}
+function readRecovery(file) {
+  noLink(file);
+  if (fs.statSync(file).size > 512 * 1024) fail('REGISTRY_DAMAGED', 'Recovery record too large');
+  return json(file);
+}
+function readCompletedRecovery(ws, file) {
+  const op = validateRecovery(ws, readRecovery(file));
+  if (!Number.isFinite(Date.parse(op.completedAt))) fail('REGISTRY_DAMAGED', 'Recovery audit is not complete');
+  session(op.completedBy, true);
+  return op;
+}
+function validateRecovery(ws, op) {
+  if (!op || op.schema !== 1 || !['cancel', 'reassign'].includes(op.action)) fail('REGISTRY_DAMAGED', 'Invalid recovery record');
+  taskId(op.task); recoveryId(op.id); session(op.by, true);
+  if (!text(op.reason, 'recovery reason') || !Number.isFinite(Date.parse(op.at))) fail('REGISTRY_DAMAGED', 'Invalid recovery reason or timestamp');
+  const before = storedTask(ws, op.before), after = storedTask(ws, op.after);
+  if (before.id !== op.task || !ACTIVE.has(before.state) || !Number.isSafeInteger(before.rev + 1) || op.id !== `${op.task}-r${before.rev + 1}`) fail('REGISTRY_DAMAGED', 'Invalid recovery target or revision');
+  const expected = storedTask(ws, { ...before, owner: op.action === 'reassign' ? after.owner : before.owner, state: op.action === 'cancel' ? 'cancelled' : before.state === 'blocked' ? 'blocked' : 'planned', rev: before.rev + 1, updatedAt: op.at });
+  if (sha(after) !== sha(expected) || (op.action === 'reassign' && (after.owner === before.owner || typeof op.marker !== 'string' || op.marker.length > 512 || op.marker.trim() !== before.owner))) fail('REGISTRY_DAMAGED', 'Recovery snapshots disagree');
+  return op;
+}
+function pendingRecovery(ws) {
+  const file = path.join(metadata(ws), 'recovery-pending.json');
+  return present(file) ? validateRecovery(ws, readRecovery(file)) : null;
+}
+function artifactMarker(ws, directory) {
+  if (!inside(ws, directory) || directory === ws) fail('INVALID_DIRECTORY', 'Recovery directory must be inside the workspace');
+  let current = ws;
+  for (const part of path.relative(ws, directory).split(path.sep).filter(Boolean)) { current = path.join(current, part); noLink(current); }
+  if (!fs.statSync(directory).isDirectory()) fail('INVALID_DIRECTORY', 'Artifact directory is missing');
+  const marker = path.join(directory, '.session-id'); noLink(marker);
+  if (!fs.statSync(marker).isFile() || fs.statSync(marker).size > 512) fail('OWNER_MISMATCH', 'Expected a regular ownership marker');
+  return marker;
+}
+function auditDirectory(root) {
+  const dir = path.join(root, 'recoveries'); noLink(dir);
+  fs.mkdirSync(dir, { recursive: true }); return dir;
+}
+function completeRecovery(ws, root, op, caller) {
+  validateRecovery(ws, op);
+  const file = path.join(root, 'tasks', op.task + '.json'); noLink(file);
+  const raw = json(file), current = storedTask(ws, raw);
+  if (raw.directory !== op.before.directory || ![sha(storedTask(ws, op.before)), sha(storedTask(ws, op.after))].includes(sha(current))) fail('RECOVERY_CHANGED', 'Task changed outside the pending recovery; preserve the journal and review it');
+  if (readClaims(ws).some(c => c.task === op.task && !['complete', 'cancelled'].includes(c.status))) fail('PENDING_ORGANIZATION', 'Cancel or finish the task organization plans before recovery');
+  let marker;
+  if (op.action === 'reassign') {
+    marker = artifactMarker(ws, op.before.directory);
+    const observed = fs.readFileSync(marker, 'utf8');
+    if (observed !== op.marker && observed !== op.after.owner + '\n') fail('RECOVERY_CHANGED', 'Ownership marker changed; preserve the journal and review it');
+  }
+  const audit = path.join(auditDirectory(root), op.id + '.json');
+  let completed;
+  if (present(audit)) {
+    completed = readCompletedRecovery(ws, audit);
+    const { completedAt: _a, completedBy: _b, ...original } = completed;
+    if (sha(original) !== sha(op)) fail('RECOVERY_CHANGED', 'Recovery audit already exists with different contents');
+  } else completed = { ...op, completedAt: new Date().toISOString(), completedBy: caller };
+  // The journal remains until marker, task and audit agree. A retry accepts
+  // either side of each write, but refuses any unrelated change.
+  if (marker) atomic(marker, op.after.owner + '\n');
+  atomic(file, op.after);
+  atomic(audit, completed);
+  fs.unlinkSync(path.join(root, 'recovery-pending.json'));
+  return { recovery: op.id, task: op.task, action: op.action, owner: op.after.owner, state: op.after.state, rev: op.after.rev, audit: `.workspace/recoveries/${op.id}.json` };
+}
+function recoverTask(ws, options) {
+  const caller = session(options.session, true);
+  needConfig(ws);
+  return locked(ws, root => {
+    const c = needConfig(ws);
+    if (c.main !== caller) fail('NOT_MAIN', 'Only the current coordinator can recover a child task');
+    const pending = pendingRecovery(ws);
+    if (options.resume) {
+      if (['action', 'task', 'from', 'to', 'reason', 'expect-rev', 'confirm-unavailable'].some(k => options[k] !== undefined)) fail('INVALID', 'Use --resume without new recovery arguments');
+      const id = options.resume === 'pending' ? pending?.id : recoveryId(options.resume);
+      if (pending) {
+        if (pending.id !== id) fail('RECOVERY_PENDING', 'A different recovery is pending', { recovery: pending.id });
+        return completeRecovery(ws, root, pending, caller);
+      }
+      if (!id) fail('NOT_FOUND', 'No pending recovery');
+      const file = path.join(root, 'recoveries', id + '.json'); noLink(path.dirname(file));
+      if (!present(file)) fail('NOT_FOUND', 'Recovery not found');
+      if (readCompletedRecovery(ws, file).id !== id) fail('REGISTRY_DAMAGED', 'Recovery filename does not match its record');
+      return { recovery: id, status: 'complete', noChanges: true };
+    }
+    if (pending) fail('RECOVERY_PENDING', 'Resume the pending recovery first', { recovery: pending.id });
+    if (!options['confirm-unavailable']) fail('CONFIRMATION_REQUIRED', 'Obtain explicit user confirmation that the old owner is unavailable, then use --confirm-unavailable');
+    if (!['cancel', 'reassign'].includes(options.action) || !text(options.reason, 'recovery reason')) fail('INVALID', 'Use --action cancel or reassign and a nonempty --reason');
+    const s = snapshot(ws), before = s.tasks.find(t => t.id === taskId(options.task));
+    if (!before) fail('NOT_FOUND', 'Task not found');
+    if (before.owner === c.main) fail('INVALID', 'This command recovers child tasks, not coordinator tasks');
+    if (session(options.from, true) !== before.owner) fail('OWNER_MISMATCH', 'Pass the exact current owner using --from');
+    if (String(before.rev) !== options['expect-rev']) fail('REVISION_MISMATCH', 'Pass the latest task --expect-rev', { actualRev: before.rev });
+    if (!ACTIVE.has(before.state)) fail('INVALID_STATE', 'Only unfinished tasks need recovery');
+    if (s.claims.some(plan => plan.task === before.id && !['complete', 'cancelled'].includes(plan.status))) fail('PENDING_ORGANIZATION', 'Cancel or finish the task organization plans first', s.claims.filter(plan => plan.task === before.id && !['complete', 'cancelled'].includes(plan.status)).map(plan => ({ id: plan.id, rev: plan.rev, status: plan.status })));
+    const to = options.action === 'reassign' ? session(options.to, true) : before.owner;
+    if (options.action === 'cancel' && options.to !== undefined) fail('INVALID', '--to applies only to reassign');
+    if (options.action === 'reassign' && to === before.owner) fail('INVALID', 'Choose a different new owner');
+    const at = new Date().toISOString(), id = `${before.id}-r${before.rev + 1}`;
+    let marker;
+    if (options.action === 'reassign') {
+      const raw = json(path.join(root, 'tasks', before.id + '.json'));
+      if (raw.directory !== before.directory) fail('DIRECTORY_CHANGED', 'Task directory changed; review ownership before recovery');
+      marker = fs.readFileSync(artifactMarker(ws, before.directory), 'utf8');
+      if (marker.trim() !== before.owner) fail('OWNER_MISMATCH', 'Directory marker must match the old owner');
+    }
+    const after = { ...before, owner: to, state: options.action === 'cancel' ? 'cancelled' : before.state === 'blocked' ? 'blocked' : 'planned', rev: before.rev + 1, updatedAt: at };
+    const op = validateRecovery(ws, { schema: 1, id, task: before.id, action: options.action, by: caller, reason: options.reason, at, before, after, ...(marker !== undefined ? { marker } : {}) });
+    const audit = path.join(auditDirectory(root), id + '.json');
+    if (present(audit)) fail('RECOVERY_CHANGED', 'Recovery id is already in use');
+    atomic(path.join(root, 'recovery-pending.json'), op);
+    return completeRecovery(ws, root, op, caller);
   });
 }
 
@@ -432,6 +585,7 @@ function handoff(ws, options) {
   return locked(ws, root => {
     const c = needConfig(ws);
     if (c.main !== who) fail('NOT_MAIN', 'Only the current coordinator can hand off');
+    requireNoRecovery({ recovery: pendingRecovery(ws) });
     if (String(c.epoch) !== options['expect-epoch']) fail('EPOCH_MISMATCH', 'Pass the current --expect-epoch');
     atomic(path.join(root, 'config.json'), { ...c, main: next, epoch: c.epoch + 1 });
     return { main: next, epoch: c.epoch + 1 };
@@ -451,11 +605,11 @@ function owners(ws, options) {
     return { ok: !issues.length, scope: 'registered-directories', owners: page(rows, options), issues: page(issues, options) };
   });
 }
-const HELP = 'Commands: init, task, context, detail, owners, check, summary, handoff. See references/commands.md; common: --workspace PATH --session ID. context/check: --limit 1..20 --offset N.';
+const HELP = 'Commands: init, task, context, detail, owners, check, summary, handoff, session-check, recover-task. See references/commands.md and references/recovery.md; common: --workspace PATH --session ID. context/check: --limit 1..20 --offset N.';
 function parse(argv) {
   const command = argv[0], options = {};
-  const flags = new Set(['adopt', 'ack-legacy']);
-  const allowed = new Set(['workspace', 'session', 'to', 'file', 'task', 'since', 'expect-rev', 'expect-epoch', 'limit', 'offset', ...flags]);
+  const flags = new Set(['adopt', 'ack-legacy', 'confirm-unavailable']);
+  const allowed = new Set(['workspace', 'session', 'to', 'file', 'task', 'since', 'expect-rev', 'expect-epoch', 'limit', 'offset', 'sessions-home', 'action', 'from', 'reason', 'resume', ...flags]);
   for (let i = 1; i < argv.length; i++) {
     const key = argv[i].startsWith('--') ? argv[i].slice(2) : '';
     if (!allowed.has(key) || key in options) fail('INVALID', 'Unknown or repeated option: ' + argv[i]);
@@ -479,12 +633,18 @@ export function execute(argv, env) {
     const fromEnv = envSession(env);
     if (fromEnv) options.session = fromEnv;
   }
+  if (['context', 'session-check'].includes(command) && !options['sessions-home']) {
+    if (typeof env?.DSH_HOME === 'string' && env.DSH_HOME.trim()) options['sessions-home'] = env.DSH_HOME;
+    else if (envSession(env)) options['sessions-home'] = path.join(os.homedir(), '.dsh');
+  }
   const ws = fs.realpathSync(path.resolve(options.workspace));
   if (!fs.statSync(ws).isDirectory()) fail('INVALID', 'Workspace must be an existing directory');
   switch (command) {
     case 'init': return init(ws, options);
     case 'task': return register(ws, options);
     case 'context': return context(ws, options);
+    case 'session-check': return checkSessions(ws, options);
+    case 'recover-task': return recoverTask(ws, options);
     case 'detail': {
       return locked(ws, () => {
         const t = snapshot(ws).tasks.find(t => t.id === taskId(options.task));

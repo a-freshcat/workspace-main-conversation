@@ -844,3 +844,21 @@ test('audit reports a recorded layout that no longer matches the tree', () => {
   assert.equal(drift.recorded, 'shared');
   assert.deepEqual(drift.directories, ['task-a']);
 });
+
+// A record-only migration (no --move-files) is how a task gets pointed at a
+// directory that already exists elsewhere. It must still leave a marked
+// directory behind — and the marker must name the task's owner, not whoever ran
+// the command. Both were broken for coordinator migrations, which no existing
+// test exercised because they all passed --move-files.
+test('a record-only migration leaves a directory marked for the task owner', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'misplaced' });
+  const moved = run(ws, 'migrate', { session: 'main', task: 'task-a', to: 'elsewhere', 'expect-rev': 1, reason: '整理目录' });
+  assert.equal(moved.moved, false);
+  assert.equal(moved.directory, 'elsewhere');
+  // The directory exists and belongs to the child, not to the coordinator.
+  assert.equal(fs.readFileSync(path.join(ws, 'elsewhere/.session-id'), 'utf8').trim(), 'child-a');
+  // And the child can still act on it afterwards.
+  assert.equal(run(ws, 'detail', { task: 'task-a' }).owner, 'child-a');
+  assert.equal(task(ws, 'task-a', 'child-a', { directory: 'elsewhere', next: '继续' }, { 'expect-rev': 2 }).rev, 3);
+});

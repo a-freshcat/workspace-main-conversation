@@ -169,11 +169,11 @@ node "$sk\zstd-frames.mjs" "<某个 session.v4.jsonl.zstd>"
 
 ```powershell
 $tests = (Get-ChildItem tests -Filter '*.test.mjs').FullName
-node --test $tests                # 128 项；链接权限受限时按原因跳过
+node --test $tests                # 129 项；链接权限受限时按原因跳过
 node selftest-portable.mjs        # 期望 {"ok":true,...}
 ```
 
-测试集合共 128 项。链接防护测试只有在 Windows 创建 junction 返回 `EPERM` 或 `EACCES` 时才标为 `SKIP`；其他错误仍会失败。跳过表示该环境没有执行链接防护断言，应在允许创建 junction 的环境重跑，不能记为通过。
+测试集合共 129 项。链接防护测试只有在 Windows 创建 junction 返回 `EPERM` 或 `EACCES` 时才标为 `SKIP`；其他错误仍会失败。跳过表示该环境没有执行链接防护断言，应在允许创建 junction 的环境重跑，不能记为通过。
 已在 Node v24.21.0 验证；zstd 功能需当前 Node 提供相应 API。
 
 ## 安全边界

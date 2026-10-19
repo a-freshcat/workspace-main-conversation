@@ -769,11 +769,13 @@ function migrateTask(ws, options) {
         fs.renameSync(source, dest);
       }
     }
+    // The directory a record points at should exist and carry the task owner's
+    // marker, whether or not files were moved: a migration is also how a record
+    // gets pointed at a directory that was created elsewhere.
     const marker = path.join(target, '.session-id');
-    if (present(target) && !present(marker)) {
-      noLink(marker);
-      fs.writeFileSync(marker, who + '\n', { flag: 'wx' });
-    }
+    fs.mkdirSync(target, { recursive: true });
+    noLink(marker);
+    if (!present(marker)) fs.writeFileSync(marker, directoryOwnerOf(old) + '\n', { flag: 'wx' });
     atomic(path.join(root, 'tasks', old.id + '.json'), record);
     return {
       id: record.id, rev: record.rev, state: record.state,

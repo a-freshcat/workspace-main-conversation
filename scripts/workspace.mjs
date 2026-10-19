@@ -11,6 +11,67 @@ const STATES = new Set([...ACTIVE, 'done', 'cancelled']);
 const EXCLUDED = new Set(['.git', META, 'node_modules', '.venv', 'venv', 'dist', 'build', '__pycache__']);
 const SCHEMA = 2;
 const OWNED = new Set(['sum.md', 'main.md']);
+// Files/directories that mean "this workspace root is itself a project", not an
+// empty lot where conversations park their artifacts. The distinction decides
+// the default layout: a project root must not be littered with per-conversation
+// directories, because its build tools, relative paths and IDE config all point
+// at the root.
+const PROJECT_MARKERS = ['package.json', 'tsconfig.json', 'Cargo.toml', 'go.mod', 'pyproject.toml', 'pom.xml', 'build.gradle', 'CMakeLists.txt', 'composer.json', 'Gemfile', 'Makefile', '.git'];
+const PROJECT_DIRS = ['src', 'lib', 'app', 'tests', 'test', 'docs', 'cmd', 'pkg'];
+// The container used for conversation artifacts in a project-shaped workspace.
+// Chosen so a project root keeps exactly one extra entry regardless of how many
+// conversations work in it, and so the per-task directory name does not repeat
+// the container's meaning (no `conversations/conversation-x`).
+const DEFAULT_ARTIFACTS = 'shared';
+
+/**
+ * Is this workspace root an empty lot or a project?
+ *
+ * The skill's own rule ("do not treat the repository root as your artifact
+ * directory") assumed the root was empty ground. A project-shaped workspace
+ * breaks that assumption: its root legitimately holds src/, tests/ and a
+ * manifest, so flat per-conversation directories have to interleave with them.
+ * Detecting the shape is what lets the default layout be right for both.
+ *
+ * @returns The detected shape, the evidence for it, and how many conversation
+ *   directories already sit directly in the root.
+ */
+function shapeOf(ws) {
+  const markers = PROJECT_MARKERS.filter(n => present(path.join(ws, n)));
+  const dirs = PROJECT_DIRS.filter(n => { const f = path.join(ws, n); try { return present(f) && fs.statSync(f).isDirectory(); } catch { return false; } });
+  const project = markers.length > 0 || dirs.length > 0;
+  const loose = conversationDirectories(ws);
+  return {
+    shape: project ? (loose.length ? 'mixed' : 'project') : 'vacant',
+    evidence: [...markers, ...dirs.map(d => d + '/')],
+    flatConversationDirectories: loose.map(d => portable(ws, d)),
+  };
+}
+/** Directories in the workspace root that look like a conversation artifact dir. */
+function conversationDirectories(ws) {
+  const base = canonical(ws, '.');
+  const found = [];
+  let entries;
+  try { entries = fs.readdirSync(base, { withFileTypes: true }); } catch { return found; }
+  for (const e of entries) {
+    if (!e.isDirectory() || EXCLUDED.has(e.name) || e.name === META) continue;
+    const full = path.join(base, e.name);
+    if (present(path.join(full, '.session-id'))) found.push(full);
+  }
+  return found;
+}
+/** Configured artifact container, or null when artifacts are flat in the root. */
+function artifactRoot(ws) {
+  const c = config(ws);
+  return c && typeof c.artifacts === 'string' && c.artifacts ? c.artifacts : null;
+}
+/** Workspace-relative container name must stay a plain directory name. */
+function artifactContainer(value) {
+  text(value, 'artifacts', 64);
+  const name = value.replace(/\\/g, '/');
+  if (!/^[A-Za-z0-9._-]+$/.test(name) || name === '.' || name === '..' || EXCLUDED.has(name) || name === META) fail('INVALID', 'Artifact container must be a single plain directory name');
+  return name;
+}
 const sha = value => createHash('sha256').update(typeof value === 'string' || Buffer.isBuffer(value) ? value : JSON.stringify(value)).digest('hex');
 const fail = (code, message, details) => { throw Object.assign(new Error(message), { code, details }); };
 const present = p => { try { fs.lstatSync(p); return true; } catch (e) { if (e.code === 'ENOENT') return false; throw e; } };
@@ -81,6 +142,7 @@ function config(ws) {
   const c = json(file);
   if (c.schema !== SCHEMA || !Number.isSafeInteger(c.epoch) || c.epoch < 1) fail('SCHEMA', 'Unsupported or malformed workspace config');
   session(c.main, true);
+  if (c.artifacts !== undefined && c.artifacts !== null) artifactContainer(c.artifacts);
   if (c.workspace !== ws) fail('WORKSPACE_MOVED', 'Workspace location changed; explicitly migrate the registry');
   return c;
 }
@@ -110,7 +172,7 @@ const overlaps = (a, b) => a === b || inside(a, b) || inside(b, a);
  * name pass `directory` explicitly; this only removes the old
  * `conversations/<id>` wrapper, which no rule depended on.
  */
-function defaultDirectory(id) { return `conversation-${id}`; }
+function defaultDirectory(id, root) { return root ? `${root}/${id}` : `conversation-${id}`; }
 function normalizeTask(ws, input, owner) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('INVALID', 'Task must be an object');
   const allowed = new Set(['id', 'goal', 'state', 'directory', 'writes', 'next', 'result', 'evidence']);
@@ -125,7 +187,7 @@ function normalizeTask(ws, input, owner) {
   // wrapper merely pushed the per-conversation directories one level out of it.
   // One conversation, one directory, directly visible -- that is the whole point
   // of the registry. See `references/commands.md` for the naming convention.
-  const directory = artifact(ws, input.directory || defaultDirectory(id));
+  const directory = artifact(ws, input.directory || defaultDirectory(id, artifactRoot(ws)));
   if (!Array.isArray(input.writes) || input.writes.length > 64) fail('INVALID', 'writes must be an array of at most 64 paths');
   const writes = [...new Set(input.writes.map(p => canonical(ws, p)))].sort();
   if (writes.some(p => overlaps(p, canonical(ws, META)))) fail('INVALID', 'Declare only task resources; metadata has its own writer');
@@ -784,6 +846,8 @@ function undeclaredAudit(ws, options) {
   return {
     schema: SCHEMA,
     scope: 'undeclared-files',
+    workspaceShape: shapeOf(ws),
+    layout: artifactRoot(ws) ? 'container' : 'flat',
     declaredFiles: live.reduce((n, t) => n + t.writes.length, 0),
     declaredDirectories: live.length,
     undeclaredFiles: found.length,
@@ -797,6 +861,76 @@ function audit(ws, options) {
   if (!config(ws)) return { ok: false, complete: false, scope: 'undeclared-files', issues: page([{ type: 'not_enabled' }], options) };
   return locked(ws, () => undeclaredAudit(ws, options));
 }
+/**
+ * Change where this workspace keeps conversation artifacts.
+ *
+ * The layout is chosen at `init` from the shape of the root, but a workspace can
+ * predate that decision, or be reorganised once the user sees the result. Flat
+ * directories in a project-shaped root are exactly the complaint this addresses:
+ * they interleave with src/ and package.json, and every build tool and IDE
+ * config assumes the root is the project.
+ *
+ * Only the coordinator can do this, because it moves every conversation's
+ * artifacts at once. It is deliberately all-or-nothing and refuses to overwrite:
+ * a half-moved layout is worse than a messy one.
+ *
+ * @param artifacts Target container name, or null/'flat' for the root itself.
+ * @returns The new layout and each directory that moved.
+ */
+function moveArtifacts(ws, options) {
+  const who = session(options.session, true);
+  return locked(ws, (root) => {
+    const c = needConfig(ws);
+    if (c.main !== who) fail('NOT_MAIN', 'Only the current coordinator can change the artifact layout');
+    if (options.artifacts === undefined) fail('INVALID', 'Pass --artifacts NAME, or --artifacts flat');
+    text(options.artifacts, 'artifacts', 64);
+    const target = options.artifacts === 'flat' ? null : artifactContainer(options.artifacts);
+    if (target === (c.artifacts ?? null)) return { layout: target ? 'container' : 'flat', artifacts: target, noChanges: true };
+    const s = snapshot(ws); requireNoRecovery(s);
+    const pending = s.claims.filter(x => !['complete', 'cancelled'].includes(x.status));
+    if (pending.length) fail('PENDING_ORGANIZATION', 'Cancel or finish the task organization plans first', pending.map(x => ({ id: x.id, status: x.status })));
+    if (String(c.epoch) !== options['expect-epoch']) fail('EPOCH_MISMATCH', 'Pass the current --expect-epoch');
+
+    // Everything is expressed relative to the CURRENT container, so the same
+    // code handles root -> container, container -> root and container -> other
+    // container. Task directories outside the current container are left alone:
+    // they were placed explicitly and this command only relocates the default
+    // layout, not someone's deliberate choice.
+    const currentRoot = c.artifacts ? canonical(ws, c.artifacts) : canonical(ws, '.');
+    const nextRoot = target === null ? canonical(ws, '.') : canonical(ws, target);
+    if (nextRoot !== canonical(ws, '.') && present(nextRoot) && !fs.statSync(nextRoot).isDirectory()) fail('INVALID_DIRECTORY', 'Artifact container is not a directory');
+
+    const plan = [];
+    for (const t of s.tasks) {
+      if (!inside(currentRoot, t.directory) || t.directory === currentRoot) continue;
+      const rel = path.relative(currentRoot, t.directory);
+      const to = nextRoot === canonical(ws, '.') ? canonical(ws, rel.split(path.sep).join('/')) : path.join(nextRoot, rel);
+      if (to === t.directory) continue;
+      plan.push({ task: t, from: t.directory, to });
+    }
+    const seen = new Set();
+    for (const m of plan) {
+      if (present(m.to)) fail('DIRECTORY_NOT_EMPTY', 'Target already exists; empty it or choose another layout', { task: m.task.id, target: portable(ws, m.to) });
+      if (seen.has(m.to)) fail('RESOURCE_CONFLICT', 'Two tasks would share one directory', { target: portable(ws, m.to) });
+      seen.add(m.to);
+    }
+    const moved = [];
+    for (const m of plan) {
+      const parent = path.dirname(m.to);
+      if (parent !== canonical(ws, '.')) fs.mkdirSync(parent, { recursive: true });
+      if (present(m.from)) fs.renameSync(m.from, m.to);
+      const follow = (q) => (q === m.from || inside(m.from, q) ? path.join(m.to, path.relative(m.from, q)) : q);
+      const writes = [...new Set(m.task.writes.map(follow))].sort();
+      atomic(path.join(root, 'tasks', m.task.id + '.json'), { ...m.task, directory: m.to, writes, updatedAt: new Date().toISOString() });
+      moved.push({ task: m.task.id, from: portable(ws, m.from), to: portable(ws, m.to) });
+    }
+    // An emptied container is removed so "flat" really means flat.
+    if (c.artifacts) { try { const old = canonical(ws, c.artifacts); if (present(old) && !fs.readdirSync(old).length) fs.rmdirSync(old); } catch { /* leave it */ } }
+    atomic(path.join(root, 'config.json'), { ...c, artifacts: target });
+    return { layout: target ? 'container' : 'flat', artifacts: target, moved, taskCount: s.tasks.length };
+  });
+}
+
 function scanFiles(ws, tasks) {
   const files = [], issues = [], seen = new Set();
   let bytes = 0, stopped = false;
@@ -894,10 +1028,21 @@ function init(ws, options) {
   const who = session(options.session, true);
   return locked(ws, root => {
     const c = config(ws);
-    if (c) { if (c.main !== who) fail('MAIN_EXISTS', 'Another coordinator already exists'); return { main: c.main, epoch: c.epoch, noChanges: true }; }
+    if (c) { if (c.main !== who) fail('MAIN_EXISTS', 'Another coordinator already exists'); return { main: c.main, epoch: c.epoch, noChanges: true, layout: c.artifacts ? 'container' : 'flat', artifacts: c.artifacts ?? null }; }
     if (!options['ack-legacy'] && ['sum.md', 'main.md'].some(n => present(path.join(ws, n)))) fail('LEGACY_WORKSPACE', 'Read migration reference and pass --ack-legacy after explicit appointment');
-    atomic(path.join(root, 'config.json'), { schema: SCHEMA, workspace: ws, main: who, epoch: 1 });
-    return { enabled: true, main: who, epoch: 1 };
+    // The layout is decided once, here, from what the root already contains.
+    // A project-shaped root keeps its tree intact and gets a single container for
+    // conversation artifacts; an empty lot keeps them flat, which is the whole
+    // point of a shared surface. Guessing wrong would either litter a project
+    // root or bury artifacts nobody can see, so the caller may also state it.
+    const detected = shapeOf(ws);
+    let artifacts = null;
+    if (options.artifacts !== undefined) {
+      text(options.artifacts, 'artifacts', 64);
+      artifacts = options.artifacts === 'flat' ? null : artifactContainer(options.artifacts);
+    } else if (detected.shape !== 'vacant') artifacts = DEFAULT_ARTIFACTS;
+    atomic(path.join(root, 'config.json'), { schema: SCHEMA, workspace: ws, main: who, epoch: 1, artifacts });
+    return { enabled: true, main: who, epoch: 1, layout: artifacts ? 'container' : 'flat', artifacts, detected };
   });
 }
 function handoff(ws, options) {
@@ -925,11 +1070,11 @@ function owners(ws, options) {
     return { ok: !issues.length, scope: 'registered-directories', owners: page(rows, options), issues: page(issues, options) };
   });
 }
-const HELP = 'Commands: init, task, migrate, archive, audit, context, detail, owners, check, summary, handoff, session-check, recover-task. See references/commands.md and references/recovery.md; common: --workspace PATH --session ID. context/check: --limit 1..20 --offset N. migrate: --task ID --to DIR --expect-rev N [--move-files]. archive: --task ID --expect-rev N --reason TEXT.';
+const HELP = 'Commands: init, task, migrate, archive, audit, move-artifacts, context, detail, owners, check, summary, handoff, session-check, recover-task. See references/commands.md and references/recovery.md; common: --workspace PATH --session ID. context/check: --limit 1..20 --offset N. migrate: --task ID --to DIR --expect-rev N [--move-files]. archive: --task ID --expect-rev N --reason TEXT.';
 function parse(argv) {
   const command = argv[0], options = {};
   const flags = new Set(['adopt', 'ack-legacy', 'confirm-unavailable', 'move-files']);
-  const allowed = new Set(['workspace', 'session', 'to', 'file', 'task', 'since', 'expect-rev', 'expect-epoch', 'limit', 'offset', 'sessions-home', 'action', 'from', 'reason', 'resume', 'scope', ...flags]);
+  const allowed = new Set(['workspace', 'session', 'to', 'file', 'task', 'since', 'expect-rev', 'expect-epoch', 'limit', 'offset', 'sessions-home', 'action', 'from', 'reason', 'resume', 'scope', 'artifacts', ...flags]);
   for (let i = 1; i < argv.length; i++) {
     const key = argv[i].startsWith('--') ? argv[i].slice(2) : '';
     if (!allowed.has(key) || key in options) fail('INVALID', 'Unknown or repeated option: ' + argv[i]);
@@ -965,6 +1110,7 @@ export function execute(argv, env) {
     case 'migrate': return migrateTask(ws, options);
     case 'archive': return archiveTask(ws, options);
     case 'audit': return audit(ws, options);
+    case 'move-artifacts': return moveArtifacts(ws, options);
     case 'context': return context(ws, options);
     case 'session-check': return checkSessions(ws, options);
     case 'recover-task': return recoverTask(ws, options);

@@ -12,6 +12,7 @@ node scripts/workspace.mjs task --workspace WORKSPACE --session SESSION --file I
 node scripts/workspace.mjs migrate --workspace WORKSPACE --session SESSION --task ID --to DIRECTORY --expect-rev REV
 node scripts/workspace.mjs migrate --workspace WORKSPACE --session SESSION --task ID --to DIRECTORY --expect-rev REV --move-files
 node scripts/workspace.mjs archive --workspace WORKSPACE --session SESSION --task ID --expect-rev REV --reason TEXT
+node scripts/workspace.mjs move-artifacts --workspace WORKSPACE --session SESSION --artifacts NAME --expect-epoch EPOCH
 node scripts/workspace.mjs audit --workspace WORKSPACE
 node scripts/workspace.mjs audit --workspace WORKSPACE --scope root --limit N
 node scripts/workspace.mjs check --workspace WORKSPACE
@@ -21,7 +22,7 @@ node scripts/workspace.mjs handoff --workspace WORKSPACE --session SESSION --to 
 node scripts/workspace.mjs session-check --workspace WORKSPACE --session MAIN_SESSION --sessions-home DSH_HOME
 ```
 
-`init` 只在用户要求启用管理并指定主对话时调用。已有 v1 的 `sum.md` / `main.md` 时额外传 `--ack-legacy`，先读迁移参考；不会导入或猜测旧 owner。
+`init` 只在用户要求启用管理并指定主对话时调用。它会检测工作区形态并决定产物目录布局（见下节），可用 `--artifacts NAME` 或 `--artifacts flat` 显式覆盖。已有 v1 的 `sum.md` / `main.md` 时额外传 `--ack-legacy`，先读迁移参考；不会导入或猜测旧 owner。
 
 任务输入是完整的当前快照，UTF-8 JSON：
 
@@ -89,3 +90,42 @@ state 可选 `planned/doing/blocked/done/cancelled`。前三者保留资源认�
 3. 认不出归属 → 用 `hint` 和 `docs/` 的项目说明判断，**不要**按修改时间或名字猜。
 
 `context` 会向主对话报告未声明文件数（仅大于 0 时出现），`summary` 把数量写进 `sum.md`，因此这个数字不会长期无人过问。看到它就值得跑一次 `audit`。
+
+## 工作区形态与产物布局
+
+**根目录是什么，决定了产物目录该放哪。** `init` 时检测一次并记进 `config.json` 的 `artifacts` 字段，之后所有默认路径都按它推导。
+
+### 空地型（vacant）
+
+根目录没有项目，只有各对话的产物。布局为 **flat**：产物目录平铺在根目录，如 `conversation-mv`。
+
+适合一次性的、以对话产出为主的场地——根目录就是所有人 `ls` 能看到的共同面。
+
+### 项目型（project）
+
+根目录本身是一个代码库：有 `package.json`、`src/`、`tests/` 之类。布局为 **container**，默认容器名 `shared`，产物目录为 `shared/<任务>`。
+
+理由是项目根不能被动：构建脚本、相对路径、IDE 配置都指向根，把每个对话的目录平铺进去会把项目结构搅乱。**项目结构保持原样**，对话产物集中在一个容器里，根目录只多一个条目。
+
+### 混合型（mixed）
+
+根目录既有项目，又已经存在平铺的产物目录。`audit` 会把它们列在 `flatConversationDirectories` 里，用 `move-artifacts` 收进容器。
+
+### 换布局
+
+```text
+node scripts/workspace.mjs move-artifacts --workspace WORKSPACE --session SESSION --artifacts shared --expect-epoch EPOCH
+node scripts/workspace.mjs move-artifacts --workspace WORKSPACE --session SESSION --artifacts flat   --expect-epoch EPOCH
+```
+
+只有主对话能改（它一次搬动所有对话的产物）。命令先规划全部迁移再动手：目标已存在、两个任务会撞到同一目录、有未完成的归拢计划、或 epoch 不对，都整体拒绝，不会留下半搬状态。搬运时目录内容、`directory` 和 `writes` 里的路径一起跟随；清空后的旧容器会被删除，所以 flat 是真的平。**不在当前容器下的任务目录不动**——那是别人显式指定的位置，不是默认布局。
+
+`audit` 会输出 `workspaceShape`（含判定依据 `evidence`）和 `layout`，主对话据此向用户解释「为什么根目录长这样」，而不必每次重新论证。
+
+### 判断某个文件该不该搬
+
+1. 它被项目运行时引用吗（入口页引用 `src/`、构建读取配置）？→ 项目基线，**不要动**。
+2. 不是的话，它是某个对话的产物吗？→ 用 `migrate` 收进该任务的产物目录。
+3. 还是认不出？→ 问用户，**不要**按修改时间或名字猜。
+
+产物目录换个位置是布局问题，文件归属不清是归属问题——`audit` 只管后者，前者用 `move-artifacts`。

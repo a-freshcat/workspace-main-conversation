@@ -758,7 +758,7 @@ function migrateTask(ws, options) {
       if (!fs.statSync(from).isDirectory()) fail('INVALID_DIRECTORY', 'Current artifact path is not a directory');
       if (present(target) && fs.readdirSync(target).length) fail('DIRECTORY_NOT_EMPTY', 'Destination already has content; migrate the record only, or empty it first');
     }
-    const record = validateMigrated(ws, { ...old, directory: target, writes, rev: old.rev + 1, updatedAt: new Date().toISOString(), ...(actor === 'coordinator' ? { lastActor: who, lastReason: options.reason } : {}) });
+    const record = storedTask(ws, { ...old, directory: target, writes, rev: old.rev + 1, updatedAt: new Date().toISOString(), ...(actor === 'coordinator' ? { lastActor: who, lastReason: options.reason } : {}) });
     if (moving && present(from)) {
       const sid = path.join(from, '.session-id');
       if (present(sid) && fs.readFileSync(sid, 'utf8').trim() !== directoryOwnerOf(old)) fail('OWNER_MISMATCH', 'Artifact directory has another owner');
@@ -786,14 +786,6 @@ function migrateTask(ws, options) {
     };
   });
 }
-/** Run a migrated record through the same normalization as any stored task. */
-function validateMigrated(ws, record) {
-  const { rev, updatedAt, owner, ...body } = record;
-  const normalized = normalizeTask(ws, body, owner);
-  if (!Number.isSafeInteger(rev) || rev < 1 || !Number.isFinite(Date.parse(updatedAt))) fail('REGISTRY_DAMAGED', 'Invalid task revision or timestamp');
-  return { ...normalized, rev, updatedAt };
-}
-
 /**
  * Drop a finished task record after archiving it.
  *
@@ -850,32 +842,67 @@ function archiveTask(ws, options) {
  * never mistaken for a clean workspace.
  */
 /**
- * Cheap undeclared-file count for `context`.
+ * Walk the workspace root and report every file no live task declares.
  *
- * A full walk on every brief would be wasteful, and `context` is read far more
- * often than `audit`. This stops at the first limit it hits and reports what it
- * saw, which is enough to make the caller run `audit` for the real inventory --
- * the number only has to be non-zero, not exact.
+ * Both the cheap `context` count and the full `audit` inventory need exactly this
+ * walk. Keeping two copies is how they drifted apart once already: one used a
+ * symmetric overlap test and silently swallowed whole source trees. One
+ * implementation with an optional `collect` keeps them honest.
+ *
+ * `limit` bounds the walk so a large repository cannot stall a brief; the
+ * inventory turns "stopped early" into `complete: false`.
  */
-function undeclaredCount(ws, tasks) {
-  const covered = declaredSet(tasks, canonical(ws, '.'));
-  let count = 0;
+function walkUndeclared(ws, tasks, { collect = false, limit = 5000 } = {}) {
+  const base = canonical(ws, '.');
+  const covered = declaredSet(tasks, base);
+  const found = [];
+  let stopped = false;
   const walk = (dir, depth) => {
-    if (count >= 5000 || depth > 8) return;
+    if (stopped) return;
+    if (depth > 8) { stopped = true; return; }
     let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    for (const entry of entries) {
-      if (count >= 5000) return;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { stopped = true; return; }
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (stopped) return;
       const full = path.join(dir, entry.name);
       if (entry.isSymbolicLink()) continue;
       if (covered(full)) continue;
-      if (entry.isDirectory()) { if (!EXCLUDED.has(entry.name)) walk(full, depth + 1); }
-      else if (entry.isFile()) count += 1;
+      if (entry.isDirectory()) {
+        if (EXCLUDED.has(entry.name)) continue;
+        walk(full, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (found.length >= limit) { stopped = true; return; }
+      let size = 0;
+      if (collect) { try { size = fs.lstatSync(full).size; } catch { continue; } }
+      found.push({ path: portable(ws, full), size });
     }
   };
-  walk(canonical(ws, '.'), 0);
-  return count;
+  walk(base, 0);
+  return { found, complete: !stopped };
 }
+/** Cheap undeclared-file count for `context`: no sizes, no grouping. */
+function undeclaredCount(ws, tasks) { return walkUndeclared(ws, tasks).found.length; }
+/**
+ * Files in the workspace that no live task declares.
+ *
+ * `check` can only answer "are the things people declared in conflict?" -- it
+ * walks `tasks[].directory` and `tasks[].writes`, so a file nobody declared is
+ * invisible to it, and two conversations could edit the same `src/main.ts`
+ * while `check` reported `ok: true`. `unregistered` covers the other half of
+ * the same blind spot (marked directories with no task); this covers loose
+ * files that belong to no artifact directory at all.
+ *
+ * Deliberately a read-only inventory, not a validator: it never fails `check`
+ * and never guesses ownership. `hint` is a naming-based description of what
+ * kind of file it looks like, and is explicitly not an attribution.
+ *
+ * Results are grouped by directory because "src/sim/ holds 22 files" is more
+ * actionable than 22 rows, and are paged so a large repository cannot flood a
+ * reply. `complete` is false whenever the walk hit a limit, so an empty list is
+ * never mistaken for a clean workspace.
+ */
 /**
  * Predicate: is this path inside something a live task declared?
  *
@@ -896,36 +923,7 @@ function declaredSet(tasks, ws) {
 function undeclaredAudit(ws, options) {
   const s = snapshot(ws);
   const live = s.tasks.filter(t => ACTIVE.has(t.state));
-  const isDeclared = declaredSet(s.tasks, canonical(ws, '.'));
-  const budget = { files: 5000, depth: 8 };
-  const found = [];
-  let files = 0, stopped = false;
-  const walk = (dir, depth) => {
-    if (stopped) return;
-    if (depth > budget.depth) { stopped = true; return; }
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { stopped = true; return; }
-    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-      if (stopped) return;
-      const full = path.join(dir, entry.name);
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) {
-        if (EXCLUDED.has(entry.name)) continue;
-        // A declared directory owns everything below it; do not walk into it.
-        if (isDeclared(full)) continue;
-        walk(full, depth + 1);
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      if (isDeclared(full)) continue;
-      if (files >= budget.files) { stopped = true; return; }
-      files += 1;
-      let size = 0;
-      try { size = fs.lstatSync(full).size; } catch { continue; }
-      found.push({ path: portable(ws, full), size });
-    }
-  };
-  walk(canonical(ws, '.'), 0);
+  const { found, complete: walkComplete } = walkUndeclared(ws, s.tasks, { collect: true });
   if (options.scope === 'root') found.splice(0, found.length, ...found.filter(f => !f.path.includes('/')));
   // Group by the containing directory so the coordinator sees shape, not noise.
   const groups = new Map();
@@ -950,7 +948,7 @@ function undeclaredAudit(ws, options) {
     undeclaredFiles: found.length,
     undeclaredBytes: found.reduce((n, f) => n + f.size, 0),
     issues: page(shape, options),
-    complete: !stopped,
+    complete: walkComplete,
     note: 'Inventory only: undeclared files are not a conflict and never fail check. hint describes the path shape, not ownership.',
   };
 }

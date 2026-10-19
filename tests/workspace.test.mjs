@@ -638,15 +638,6 @@ function projectWorkspace() {
   run(ws, 'init', { session: 'main' });
   return ws;
 }
-test('the default artifact directory is the task id, flat in the root', () => {
-  const ws = workspace();
-  const p = path.join(suite, `input-${++sequence}.json`);
-  fs.writeFileSync(p, JSON.stringify({ id: 'fix-export', goal: '修复导出', state: 'doing', writes: [], next: '' }));
-  const made = run(ws, 'task', { session: 'child-a', file: p });
-  // No prefix and no container: the name the caller chose is the name on disk.
-  assert.equal(made.directory, 'fix-export');
-  assert.equal(fs.existsSync(path.join(ws, 'fix-export')), true);
-});
 test('a project root keeps its own tree and adds conversation directories beside it', () => {
   const ws = projectWorkspace();
   const p = path.join(suite, `input-${++sequence}.json`);

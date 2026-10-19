@@ -1,4 +1,4 @@
-# workspace-main-conversation v2.3.2
+# workspace-main-conversation v2.3.3
 
 一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) / Codex skill：
 **让共享工作区里的多个对话不再各干各的、互相撞车。**
@@ -11,6 +11,7 @@
 > 却没登记任务的目录。此前这类对话对统筹完全不可见（`tasks: 0` 和"什么都没干"
 > 长得一模一样），可能让已有产物的对话仍未进入统筹视图。
 > 变更细节见 [re_note.md](re_note.md)。
+> **v2.3.3 起**：产物目录默认平铺在工作区根目录（`conversation-<任务>`），不再套 `conversations/` 容器层。
 > **v2.3.1 起**：任务目录放错不再是死局——`migrate` 提供正当代改口，`archive` 让主对话
 > 能清理自己的终态记录；`check`/`summary` 只扫活动任务，一条指向已删目录的取消记录不会
 > 再让整个工作区的基线永久失效。

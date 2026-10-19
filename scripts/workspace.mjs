@@ -101,6 +101,15 @@ function artifact(ws, value) {
   return p;
 }
 const overlaps = (a, b) => a === b || inside(a, b) || inside(b, a);
+/**
+ * Default artifact directory for a task, flat in the workspace root.
+ *
+ * Deriving it from the id keeps the default predictable and self-describing:
+ * `fix-export` becomes `conversation-fix-export`. Callers that want a dated
+ * name pass `directory` explicitly; this only removes the old
+ * `conversations/<id>` wrapper, which no rule depended on.
+ */
+function defaultDirectory(id) { return `conversation-${id}`; }
 function normalizeTask(ws, input, owner) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('INVALID', 'Task must be an object');
   const allowed = new Set(['id', 'goal', 'state', 'directory', 'writes', 'next', 'result', 'evidence']);
@@ -108,7 +117,14 @@ function normalizeTask(ws, input, owner) {
   const id = taskId(input.id);
   const goal = text(input.goal, 'goal');
   if (!goal || !STATES.has(input.state)) fail('INVALID', 'Task requires goal and valid state');
-  const directory = artifact(ws, input.directory || `conversations/${id}`);
+  // The default artifact directory sits flat in the workspace root, named after
+  // the task, e.g. `conversation-2026-10-19-fix-export`. It used to be
+  // `conversations/<id>`, which added a container level that bought nothing: the
+  // workspace root is the shared surface every conversation reads (`ls`), and a
+  // wrapper merely pushed the per-conversation directories one level out of it.
+  // One conversation, one directory, directly visible -- that is the whole point
+  // of the registry. See `references/commands.md` for the naming convention.
+  const directory = artifact(ws, input.directory || defaultDirectory(id));
   if (!Array.isArray(input.writes) || input.writes.length > 64) fail('INVALID', 'writes must be an array of at most 64 paths');
   const writes = [...new Set(input.writes.map(p => canonical(ws, p)))].sort();
   if (writes.some(p => overlaps(p, canonical(ws, META)))) fail('INVALID', 'Declare only task resources; metadata has its own writer');

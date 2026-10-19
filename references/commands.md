@@ -28,7 +28,7 @@ node scripts/workspace.mjs session-check --workspace WORKSPACE --session MAIN_SE
   "id": "fix-export",
   "goal": "修复导出结果缺少末行",
   "state": "doing",
-  "directory": "conversations/fix-export",
+  "directory": "conversation-2026-10-19-fix-export",
   "writes": ["src/export.mjs"],
   "next": "补回归样例并验证",
   "result": "",
@@ -37,6 +37,8 @@ node scripts/workspace.mjs session-check --workspace WORKSPACE --session MAIN_SE
 ```
 
 state 可选 `planned/doing/blocked/done/cancelled`。前三者保留资源认领；完成/取消后释放。创建任务不传 expect-rev；更新必须传当前版本，其他对话不能覆盖。产物目录不可交叉；已有未标记非空目录须用 `--adopt`，且须用户明确确认该目录归属。不要把代码库根或公共源码目录当成个人产物目录。
+
+产物目录**平铺在工作区根目录**，一个对话一个目录，用 `conversation-<日期>-<任务>` 这类可读名字，不要套 `conversations/` 之类的容器层——根目录是所有人 `ls` 就能看到的共同面，多一层只会把每个对话的目录推出视野，认领和冲突审查反而更难。省略 `directory` 时默认用 `conversation-<任务id>`，需要日期或自定义命名就显式写。
 
 `task` 不接受在更新时静默改产物目录，`DIRECTORY_CHANGED` 会在 `details.migrate` 里给出可直接执行的 `migrate` 调用。`migrate` 只由任务 owner 对自己任务发起，需要 `--to` 和最新 `--expect-rev`。**目标目录的接管规则与 `task` 完全一致**：带别的对话 `.session-id` 标记的目录直接拒绝（`OWNER_MISMATCH`），未标记但非空的目录必须显式 `--adopt`（`ADOPTION_REQUIRED`）——`migrate` 不是绕过认领要求的途径。冲突按迁移后**实际会认领**的内容判定（目录 + 改写后的 writes），与活动任务重叠即拒绝且不写任何记录；终态任务已释放目录。迁移会同步改写 `writes` 里位于旧目录内的条目，使「认领整个目录」的声明跟着走；无关声明原样保留。默认只改登记，加 `--move-files` 才把旧目录内容搬到新目录——目标是已存在且非空的真实目录时拒绝，搬到什么就保留什么，内容为空后的旧目录不会被删除。目录标记随内容走；目标没有标记时补写。
 

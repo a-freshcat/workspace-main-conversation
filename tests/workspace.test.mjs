@@ -61,6 +61,31 @@ test('task has an explicit marker, no-op updates preserve revision, stale writes
   throwsCode(() => task(ws, 'task-a', 'child-a', {}, { 'expect-rev': 1 }), 'REVISION_MISMATCH');
   throwsCode(() => task(ws, 'task-a', 'child-b'), 'OWNER_MISMATCH');
 });
+// The default artifact directory must be a single flat directory in the
+// workspace root. It used to be `conversations/<id>`, which wrapped every
+// per-conversation directory in a container that bought nothing and pushed the
+// shared surface one level out of view. Every other test passes `directory`
+// explicitly, so the default itself went untested -- which is how the layout
+// drifted away from the intended convention unnoticed.
+test('the default artifact directory is flat in the workspace root, not wrapped', () => {
+  const ws = workspace();
+  // No explicit directory: the task id alone decides where it lands.
+  const p = path.join(suite, `input-${++sequence}.json`);
+  fs.writeFileSync(p, JSON.stringify({ id: 'fix-export', goal: '修复导出', state: 'doing', writes: [], next: '' }));
+  const made = run(ws, 'task', { session: 'child-a', file: p });
+
+  assert.equal(made.directory, 'conversation-fix-export');
+  assert.equal(fs.existsSync(path.join(ws, 'conversation-fix-export')), true);
+  assert.equal(fs.readFileSync(path.join(ws, 'conversation-fix-export/.session-id'), 'utf8').trim(), 'child-a');
+  // No wrapper container is created, and nothing lives under `conversations/`.
+  assert.equal(fs.existsSync(path.join(ws, 'conversations')), false);
+  // The directory is visible in the shared root, which is what makes `ls` a
+  // usable inventory for the coordinator.
+  assert.ok(fs.readdirSync(ws).includes('conversation-fix-export'));
+  // An explicit directory still wins, for dated names or nested layouts.
+  task(ws, 'custom', 'child-b', { directory: 'conversation-2026-10-19-custom' });
+  assert.equal(fs.existsSync(path.join(ws, 'conversation-2026-10-19-custom')), true);
+});
 test('ordinary project directories are outside registered ownership audit', () => {
   const ws = workspace(); fs.mkdirSync(path.join(ws, 'src')); fs.mkdirSync(path.join(ws, 'docs'));
   run(ws, 'summary', { session: 'main' });

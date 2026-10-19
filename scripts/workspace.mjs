@@ -10,6 +10,7 @@ const ACTIVE = new Set(['planned', 'doing', 'blocked']);
 const STATES = new Set([...ACTIVE, 'done', 'cancelled']);
 const EXCLUDED = new Set(['.git', META, 'node_modules', '.venv', 'venv', 'dist', 'build', '__pycache__']);
 const SCHEMA = 2;
+const OWNED = new Set(['sum.md', 'main.md']);
 const sha = value => createHash('sha256').update(typeof value === 'string' || Buffer.isBuffer(value) ? value : JSON.stringify(value)).digest('hex');
 const fail = (code, message, details) => { throw Object.assign(new Error(message), { code, details }); };
 const present = p => { try { fs.lstatSync(p); return true; } catch (e) { if (e.code === 'ENOENT') return false; throw e; } };
@@ -331,6 +332,16 @@ function context(ws, options) {
     if (unregistered.length) view.unregistered = unregistered;
     const pending = s.claims.filter(c => !['complete','cancelled'].includes(c.status) && (role === 'main' || c.owner === who)).map(c => ({ id: c.id, task: c.task, owner: c.owner, status: c.status, count: c.entries.length, rev: c.rev }));
     if (pending.length) view.claims = pending;
+    // Cheap signal, not an inventory: the coordinator needs to know that an
+    // audit is worth running, without paying for a full walk on every brief.
+    // Only `main` gets it -- chasing undeclared files is a coordination job,
+    // and a child cannot act on another conversation's leftovers. Listing the
+    // files here would flood the brief, so only the count appears; `audit`
+    // gives the detail.
+    if (role === 'main') {
+      const undeclared = undeclaredCount(ws, s.tasks);
+      if (undeclared > 0) view.undeclaredCount = undeclared;
+    }
     const stamp = sha(view).slice(0, 24);
     const scope = view.sessionCheck?.scope === 'dsh-record-presence' ? 'declared-metadata+session-record-presence' : 'declared-metadata';
     if (options.since === stamp) return { stamp, noChanges: true, scope };
@@ -352,7 +363,7 @@ function context(ws, options) {
     const registeredDirs = previous ? (previous.unregistered || []).filter(u => !(view.unregistered || []).some(n => n.path === u.path)).map(u => u.path) : [];
     history = [{ stamp, view }, ...history.filter(h => h.stamp !== stamp)].slice(0, 2);
     atomic(cache, history);
-    return { stamp, role, epoch: view.epoch, mode: previous ? 'delta' : 'snapshot', ...(options.since && !previous ? { reset: true } : {}), scope, ...(view.sessionCheck ? { sessionCheck: view.sessionCheck } : {}), ...(role === 'unknown' ? { identity: identity(who) } : {}), taskCount: view.tasks.length, alertCount: view.alerts.length, tasks: page(tasks, options), alerts: page(alerts, options), removedTasks: page(removedTasks, options), resolvedAlerts: page(resolvedAlerts, options), ...(view.unregistered ? { unregisteredCount: view.unregistered.length, unregistered: page(unregisteredDelta, options), ...(registeredDirs.length ? { registeredDirectories: page(registeredDirs, options) } : {}) } : {}), ...(pending.length || resolvedClaims.length ? { claims: page(claims,options), resolvedClaims: page(resolvedClaims,options) } : {}) };
+    return { stamp, role, epoch: view.epoch, mode: previous ? 'delta' : 'snapshot', ...(options.since && !previous ? { reset: true } : {}), scope, ...(view.sessionCheck ? { sessionCheck: view.sessionCheck } : {}), ...(role === 'unknown' ? { identity: identity(who) } : {}), ...(view.undeclaredCount ? { undeclaredCount: view.undeclaredCount } : {}), taskCount: view.tasks.length, alertCount: view.alerts.length, tasks: page(tasks, options), alerts: page(alerts, options), removedTasks: page(removedTasks, options), resolvedAlerts: page(resolvedAlerts, options), ...(view.unregistered ? { unregisteredCount: view.unregistered.length, unregistered: page(unregisteredDelta, options), ...(registeredDirs.length ? { registeredDirectories: page(registeredDirs, options) } : {}) } : {}), ...(pending.length || resolvedClaims.length ? { claims: page(claims,options), resolvedClaims: page(resolvedClaims,options) } : {}) };
   });
 }
 function register(ws, options) {
@@ -661,6 +672,131 @@ function archiveTask(ws, options) {
   });
 }
 
+/**
+ * Files in the workspace that no live task declares.
+ *
+ * `check` can only answer "are the things people declared in conflict?" -- it
+ * walks `tasks[].directory` and `tasks[].writes`, so a file nobody declared is
+ * invisible to it, and two conversations could edit the same `src/main.ts`
+ * while `check` reported `ok: true`. `unregistered` covers the other half of
+ * the same blind spot (marked directories with no task); this covers loose
+ * files that belong to no artifact directory at all.
+ *
+ * Deliberately a read-only inventory, not a validator: it never fails `check`
+ * and never guesses ownership. `hint` is a naming-based description of what
+ * kind of file it looks like, and is explicitly not an attribution.
+ *
+ * Results are grouped by directory because "src/sim/ holds 22 files" is more
+ * actionable than 22 rows, and are paged so a large repository cannot flood a
+ * reply. `complete` is false whenever the walk hit a limit, so an empty list is
+ * never mistaken for a clean workspace.
+ */
+/**
+ * Cheap undeclared-file count for `context`.
+ *
+ * A full walk on every brief would be wasteful, and `context` is read far more
+ * often than `audit`. This stops at the first limit it hits and reports what it
+ * saw, which is enough to make the caller run `audit` for the real inventory --
+ * the number only has to be non-zero, not exact.
+ */
+function undeclaredCount(ws, tasks) {
+  const covered = declaredSet(tasks, canonical(ws, '.'));
+  let count = 0;
+  const walk = (dir, depth) => {
+    if (count >= 5000 || depth > 8) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (count >= 5000) return;
+      const full = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (covered(full)) continue;
+      if (entry.isDirectory()) { if (!EXCLUDED.has(entry.name)) walk(full, depth + 1); }
+      else if (entry.isFile()) count += 1;
+    }
+  };
+  walk(canonical(ws, '.'), 0);
+  return count;
+}
+/**
+ * Predicate: is this path inside something a live task declared?
+ *
+ * Deliberately one-directional. The overlap helper used everywhere else is
+ * symmetric, which is correct for "do these two claims collide" and wrong for
+ * "is this file accounted for": a declared file does not declare its parent
+ * directory, so a symmetric test made one declared file under a source tree
+ * swallow the whole tree and hide every undeclared sibling -- the exact blind
+ * spot this feature exists to close.
+ */
+function declaredSet(tasks, ws) {
+  const declared = tasks.filter(t => ACTIVE.has(t.state)).flatMap(t => [t.directory, ...t.writes]);
+  return p => {
+    if (ws && OWNED.has(path.basename(p)) && path.dirname(p) === ws) return true;
+    return declared.some(d => d === p || inside(d, p));
+  };
+}
+function undeclaredAudit(ws, options) {
+  const s = snapshot(ws);
+  const live = s.tasks.filter(t => ACTIVE.has(t.state));
+  const isDeclared = declaredSet(s.tasks, canonical(ws, '.'));
+  const budget = { files: 5000, depth: 8 };
+  const found = [];
+  let files = 0, stopped = false;
+  const walk = (dir, depth) => {
+    if (stopped) return;
+    if (depth > budget.depth) { stopped = true; return; }
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { stopped = true; return; }
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (stopped) return;
+      const full = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        if (EXCLUDED.has(entry.name)) continue;
+        // A declared directory owns everything below it; do not walk into it.
+        if (isDeclared(full)) continue;
+        walk(full, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (isDeclared(full)) continue;
+      if (files >= budget.files) { stopped = true; return; }
+      files += 1;
+      let size = 0;
+      try { size = fs.lstatSync(full).size; } catch { continue; }
+      found.push({ path: portable(ws, full), size });
+    }
+  };
+  walk(canonical(ws, '.'), 0);
+  if (options.scope === 'root') found.splice(0, found.length, ...found.filter(f => !f.path.includes('/')));
+  // Group by the containing directory so the coordinator sees shape, not noise.
+  const groups = new Map();
+  for (const f of found) {
+    const dir = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) + '/' : '';
+    if (!groups.has(dir)) groups.set(dir, { path: dir || '.', files: 0, bytes: 0 });
+    const g = groups.get(dir);
+    g.files += 1; g.bytes += f.size;
+  }
+  const shape = [...groups.values()].map(g => {
+    const first = found.find(f => (g.path === '.' ? !f.path.includes('/') : f.path.startsWith(g.path + '/')));
+    return { ...g, hint: g.path === '.' ? 'root-level-file' : EXCLUDED.has(g.path.split('/')[0]) ? 'excluded-tree' : 'undeclared-tree', ...(g.files === 1 ? { example: first?.path } : {}) };
+  }).sort((a, b) => b.files - a.files || a.path.localeCompare(b.path));
+  return {
+    schema: SCHEMA,
+    scope: 'undeclared-files',
+    declaredFiles: live.reduce((n, t) => n + t.writes.length, 0),
+    declaredDirectories: live.length,
+    undeclaredFiles: found.length,
+    undeclaredBytes: found.reduce((n, f) => n + f.size, 0),
+    issues: page(shape, options),
+    complete: !stopped,
+    note: 'Inventory only: undeclared files are not a conflict and never fail check. hint describes the path shape, not ownership.',
+  };
+}
+function audit(ws, options) {
+  if (!config(ws)) return { ok: false, complete: false, scope: 'undeclared-files', issues: page([{ type: 'not_enabled' }], options) };
+  return locked(ws, () => undeclaredAudit(ws, options));
+}
 function scanFiles(ws, tasks) {
   const files = [], issues = [], seen = new Set();
   let bytes = 0, stopped = false;
@@ -743,11 +879,15 @@ function summarize(ws, options) {
     noLink(sum);
     if (present(sum) && !fs.readFileSync(sum, 'utf8').startsWith(marker)) fail('LEGACY_SUMMARY', 'Keep or move the existing manual/v1 sum.md before generating v2');
     const escape = s => String(s).replaceAll('|', '\\|').replace(/[\r\n]/g, ' ');
+    // Record the undeclared count so it cannot go unnoticed forever: every stage
+    // summary states it and the next reader sees whether it is growing. A remark,
+    // never a gate -- undeclared files are inventory, not a conflict.
+    const undeclared = undeclaredCount(ws, r.s.tasks);
     const rows = r.s.tasks.map(t => `| ${[t.id, t.owner, t.state, t.goal, portable(ws, t.directory), t.rev].map(escape).join(' | ')} |`);
-    const body = [marker, '# 工作区统筹', '', `主对话：${who}；交接版本：${r.s.config.epoch}`, '', '| 任务 | 对话 | 状态 | 目标 | 产物 | 版本 |', '|---|---|---|---|---|---|', ...rows, '', `声明资源检查：无重叠；扫描 ${r.scan.files.length} 个文件。`, '检查范围与排除项见 skill 命令参考；本页不代表未登记活动已被检查。', '详细结果见 .workspace/tasks/；修改本页请通过 summary 命令。', ''].join('\n');
+    const body = [marker, '# 工作区统筹', '', `主对话：${who}；交接版本：${r.s.config.epoch}`, '', '| 任务 | 对话 | 状态 | 目标 | 产物 | 版本 |', '|---|---|---|---|---|---|', ...rows, '', `声明资源检查：无重叠；扫描 ${r.scan.files.length} 个文件。`, `未声明文件：${undeclared} 个（详见 audit 命令）。`, '检查范围与排除项见 skill 命令参考；本页不代表未登记活动已被检查。', '详细结果见 .workspace/tasks/；修改本页请通过 summary 命令。', ''].join('\n');
     atomic(sum, body);
     atomic(path.join(root, 'summary.json'), { schema: SCHEMA, stateHash: r.stateHash, summaryHash: sha(body), files: r.scan.files });
-    return { summary: 'sum.md', taskCount: r.s.tasks.length, fileCount: r.scan.files.length, complete: true };
+    return { summary: 'sum.md', taskCount: r.s.tasks.length, fileCount: r.scan.files.length, undeclaredFiles: undeclared, complete: true };
   });
 }
 function init(ws, options) {
@@ -785,11 +925,11 @@ function owners(ws, options) {
     return { ok: !issues.length, scope: 'registered-directories', owners: page(rows, options), issues: page(issues, options) };
   });
 }
-const HELP = 'Commands: init, task, migrate, archive, context, detail, owners, check, summary, handoff, session-check, recover-task. See references/commands.md and references/recovery.md; common: --workspace PATH --session ID. context/check: --limit 1..20 --offset N. migrate: --task ID --to DIR --expect-rev N [--move-files]. archive: --task ID --expect-rev N --reason TEXT.';
+const HELP = 'Commands: init, task, migrate, archive, audit, context, detail, owners, check, summary, handoff, session-check, recover-task. See references/commands.md and references/recovery.md; common: --workspace PATH --session ID. context/check: --limit 1..20 --offset N. migrate: --task ID --to DIR --expect-rev N [--move-files]. archive: --task ID --expect-rev N --reason TEXT.';
 function parse(argv) {
   const command = argv[0], options = {};
   const flags = new Set(['adopt', 'ack-legacy', 'confirm-unavailable', 'move-files']);
-  const allowed = new Set(['workspace', 'session', 'to', 'file', 'task', 'since', 'expect-rev', 'expect-epoch', 'limit', 'offset', 'sessions-home', 'action', 'from', 'reason', 'resume', ...flags]);
+  const allowed = new Set(['workspace', 'session', 'to', 'file', 'task', 'since', 'expect-rev', 'expect-epoch', 'limit', 'offset', 'sessions-home', 'action', 'from', 'reason', 'resume', 'scope', ...flags]);
   for (let i = 1; i < argv.length; i++) {
     const key = argv[i].startsWith('--') ? argv[i].slice(2) : '';
     if (!allowed.has(key) || key in options) fail('INVALID', 'Unknown or repeated option: ' + argv[i]);
@@ -824,6 +964,7 @@ export function execute(argv, env) {
     case 'task': return register(ws, options);
     case 'migrate': return migrateTask(ws, options);
     case 'archive': return archiveTask(ws, options);
+    case 'audit': return audit(ws, options);
     case 'context': return context(ws, options);
     case 'session-check': return checkSessions(ws, options);
     case 'recover-task': return recoverTask(ws, options);

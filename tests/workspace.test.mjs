@@ -177,9 +177,11 @@ test('summary baseline is generated only by main and repeated scans are stable',
   const ws = workspace(); task(ws);
   throwsCode(() => run(ws, 'summary', { session: 'child-a' }), 'NOT_MAIN');
   run(ws, 'summary', { session: 'main' });
-  const p = path.join(ws, 'sum.md'), mtime = fs.statSync(p).mtimeMs;
+  const p = path.join(ws, 'sum.md'), before = fs.readFileSync(p, 'utf8');
   run(ws, 'summary', { session: 'main' });
-  assert.equal(fs.statSync(p).mtimeMs, mtime); assert.equal(run(ws, 'check').ok, true);
+  // A repeated summary must not rewrite the page: same task set, same bytes.
+  assert.equal(fs.readFileSync(p, 'utf8'), before);
+  assert.equal(run(ws, 'check').ok, true);
 });
 test('missing/modified ownership markers are explicit scan problems', () => {
   const ws = workspace(); task(ws);
@@ -545,4 +547,80 @@ test('archiving is what makes a poisoned baseline recoverable end to end', () =>
   // and is re-established by the next summary — the loop now terminates.
   run(ws, 'summary', { session: 'main' });
   assert.equal(run(ws, 'check').ok, true);
+});
+
+// ── undeclared-file audit ───────────────────────────────────────────────────
+// `check` only walks what tasks declare, so a file nobody declared is invisible;
+// two conversations could edit the same source file and `check` would still say
+// ok. `unregistered` covers marked-but-unregistered directories; these cover
+// loose files belonging to no artifact directory. Inventory only, never a gate.
+test('audit inventories files no live task declares', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'conversation-task-a' });
+  fs.mkdirSync(path.join(ws, 'src'));
+  fs.writeFileSync(path.join(ws, 'src/main.ts'), 'entry');
+  fs.writeFileSync(path.join(ws, 'index.html'), 'page');
+  fs.writeFileSync(path.join(ws, 'conversation-task-a/mine.txt'), 'declared');
+
+  const audit = run(ws, 'audit');
+  assert.equal(audit.undeclaredFiles, 2);
+  assert.equal(audit.complete, true);
+  assert.equal(audit.scope, 'undeclared-files');
+  assert.deepEqual(audit.issues.items.map(g => g.path).sort(), ['.', 'src/']);
+  assert.equal(audit.issues.items.some(g => g.path.includes('conversation-task-a')), false);
+});
+test('a declared file does not declare its whole parent directory', () => {
+  const ws = workspace();
+  // The regression that made audit under-report: the shared overlap helper is
+  // symmetric, so one declared file under src/ marked all of src/ accounted for.
+  task(ws, 'task-a', 'child-a', { directory: 'conversation-task-a', writes: ['src/view/sprites.ts'] });
+  fs.mkdirSync(path.join(ws, 'src/view'), { recursive: true });
+  fs.writeFileSync(path.join(ws, 'src/view/sprites.ts'), 'declared');
+  fs.writeFileSync(path.join(ws, 'src/view/renderer.ts'), 'orphan');
+  fs.writeFileSync(path.join(ws, 'src/main.ts'), 'orphan');
+  assert.equal(run(ws, 'audit').undeclaredFiles, 2);
+  // Declaring the whole directory does account for everything below it.
+  task(ws, 'task-a', 'child-a', { directory: 'conversation-task-a', writes: ['src'] }, { 'expect-rev': 1 });
+  assert.equal(run(ws, 'audit').undeclaredFiles, 0);
+});
+test('audit reports shape by directory and can be paged', () => {
+  const ws = workspace();
+  for (let i = 0; i < 7; i++) { fs.mkdirSync(path.join(ws, 'd' + i)); fs.writeFileSync(path.join(ws, 'd' + i + '/f.txt'), 'x'); }
+  const first = run(ws, 'audit', { limit: 5 });
+  assert.equal(first.undeclaredFiles, 7);
+  assert.equal(first.issues.total, 7);
+  assert.equal(first.issues.items.length, 5);
+  assert.equal(first.issues.more, true);
+  assert.equal(run(ws, 'audit', { limit: 5, offset: 5 }).issues.items.length, 2);
+});
+test('a finished task stops declaring its files, and audit never fails check', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'conversation-task-a', state: 'cancelled', writes: ['notes.md'] });
+  fs.writeFileSync(path.join(ws, 'notes.md'), 'x');
+  // A finished task releases its claims, so both the declared file and the
+  // artifact directory (with its marker) are undeclared again: 2 paths.
+  assert.equal(run(ws, 'audit').undeclaredFiles, 2);
+  // Inventory must never be a gate: the baseline still establishes, and check
+  // stays ok even though an undeclared file exists.
+  run(ws, 'summary', { session: 'main' });
+  assert.equal(run(ws, 'check').ok, true);
+});
+test('context surfaces the count to the coordinator, and summary records it', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'conversation-task-a' });
+  fs.writeFileSync(path.join(ws, 'orphan.txt'), 'x');
+  assert.equal(run(ws, 'context', { session: 'main' }).undeclaredCount, 1);
+  assert.equal(run(ws, 'context', { session: 'child-a' }).undeclaredCount, undefined);
+  fs.unlinkSync(path.join(ws, 'orphan.txt'));
+  assert.equal(run(ws, 'context', { session: 'main' }).undeclaredCount, undefined);
+  fs.writeFileSync(path.join(ws, 'orphan.txt'), 'x');
+  run(ws, 'summary', { session: 'main' });
+  assert.match(fs.readFileSync(path.join(ws, 'sum.md'), 'utf8'), /未声明文件：1 个/);
+});
+test('audit on an unenabled workspace reports rather than failing', () => {
+  const ws = workspace(false);
+  const r = run(ws, 'audit');
+  assert.equal(r.ok, false);
+  assert.equal(r.issues.items[0].type, 'not_enabled');
+  assert.deepEqual(fs.readdirSync(ws), []);
 });

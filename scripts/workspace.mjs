@@ -157,8 +157,13 @@ function alertsFor(tasks, claims = []) {
   const alerts = [];
   for (let a = 0; a < tasks.length; a++) for (let b = a + 1; b < tasks.length; b++) {
     const x = tasks[a], y = tasks[b];
-    if (overlaps(x.directory, y.directory)) alerts.push({ type: 'directory_overlap', tasks: [x.id, y.id], path: x.directory });
+    // A finished task releases what it claimed, its directory included. Gating
+    // only `resource_overlap` left `directory_overlap` behind, so "cancel the
+    // task, then claim that directory properly" — the obvious repair for a
+    // directory chosen wrongly — stayed blocked by a permanent alert on two
+    // records that no longer do any work.
     if (!ACTIVE.has(x.state) || !ACTIVE.has(y.state)) continue;
+    if (overlaps(x.directory, y.directory)) alerts.push({ type: 'directory_overlap', tasks: [x.id, y.id], path: x.directory });
     for (const p of x.writes) for (const q of y.writes) if (overlaps(p, q)) alerts.push({ type: 'resource_overlap', tasks: [x.id, y.id], path: p, otherPath: q });
   }
   for (const c of claims.filter(c => !['complete','cancelled'].includes(c.status))) {
@@ -344,21 +349,36 @@ function register(ws, options) {
     if (old && old.owner !== who) fail('OWNER_MISMATCH', 'Task belongs to another session');
     if (old && String(old.rev) !== options['expect-rev']) fail('REVISION_MISMATCH', 'Pass the latest --expect-rev', { actualRev: old.rev });
     if (!old && options['expect-rev'] !== undefined) fail('REVISION_MISMATCH', 'New task has no prior revision');
-    if (old && old.directory !== current.directory) fail('DIRECTORY_CHANGED', 'Task artifact directory is stable; explicitly migrate instead');
+    // A directory chosen wrongly used to be unrecoverable: the error told the
+    // caller to "explicitly migrate" but no such command existed, and no other
+    // command could change it. Name the real command and print its arguments.
+    if (old && old.directory !== current.directory)
+      fail('DIRECTORY_CHANGED', 'Task artifact directory is stable; change it with the migrate command', {
+        migrate: ['migrate', '--workspace', ws, '--session', who, '--task', old.id, '--to', portable(ws, current.directory), '--expect-rev', old.rev],
+        directory: portable(ws, old.directory),
+        requested: portable(ws, current.directory),
+      });
     const { rev: _r, updatedAt: _u, ...oldBody } = old || {};
     if (old && sha(oldBody) === sha(current)) return { id: old.id, rev: old.rev, noChanges: true };
     const others = s.tasks.filter(t => t.id !== current.id);
     const clashes = alertsFor([...others, current], s.claims).filter(a => a.tasks.includes(current.id));
     if (clashes.length) fail('RESOURCE_CONFLICT', 'Declared resources overlap another task', page(clashes, options));
     const sid = path.join(current.directory, '.session-id');
+    // A finished task is a historical record: its directory is the user's to
+    // keep or delete. Recreating it here meant that editing nothing but the
+    // `result` text resurrected an empty shell, so cleanup could never stay done.
+    // Ownership is still verified for a directory that happens to exist.
+    const hasLiveDirectory = !old || ACTIVE.has(old.state) || ACTIVE.has(current.state);
     if (present(current.directory)) {
       if (!fs.statSync(current.directory).isDirectory()) fail('INVALID_DIRECTORY', 'Artifact path is not a directory');
       noLink(sid);
       if (present(sid) && fs.readFileSync(sid, 'utf8').trim() !== who) fail('OWNER_MISMATCH', 'Artifact directory has another owner');
       if (!present(sid) && fs.readdirSync(current.directory).length && !options.adopt) fail('ADOPTION_REQUIRED', 'Existing nonempty directory needs confirmed ownership and --adopt');
     }
-    fs.mkdirSync(current.directory, { recursive: true });
-    if (!present(sid)) fs.writeFileSync(sid, who + '\n', { flag: 'wx' });
+    if (hasLiveDirectory) {
+      fs.mkdirSync(current.directory, { recursive: true });
+      if (!present(sid)) fs.writeFileSync(sid, who + '\n', { flag: 'wx' });
+    }
     const record = { ...current, rev: (old?.rev ?? 0) + 1, updatedAt: new Date().toISOString() };
     atomic(path.join(root, 'tasks', current.id + '.json'), record);
     return { id: record.id, rev: record.rev, state: record.state, directory: portable(ws, record.directory) };
@@ -487,6 +507,119 @@ function recoverTask(ws, options) {
   });
 }
 
+/**
+ * Move a task's artifact directory.
+ *
+ * Registration freezes `directory` so that a task cannot silently drift away
+ * from the resources it claims, but the freeze had no escape hatch: a directory
+ * chosen wrongly was wrong forever, and the documented rule ("do not treat the
+ * repository root as your artifact directory") became unenforceable in practice
+ * because the only repair was hand-editing the registry.
+ *
+ * The freeze therefore stays, and this is the explicit unfreeze. It is
+ * deliberately narrower than a re-registration:
+ *   - the new directory must be a legal artifact path, and free of any *live*
+ *     task's claim (a finished task releases its directory);
+ *   - `writes` are rewritten to follow the move, so an owner that declared
+ *     "my whole directory" keeps claiming it afterwards;
+ *   - the ownership marker travels with the content; content is only moved
+ *     when the caller confirms `--move-files`, and only when the destination
+ *     does not already hold something.
+ *
+ * @returns The new revision, both directories, and whether files were moved.
+ */
+function migrateTask(ws, options) {
+  const who = session(options.session, true);
+  return locked(ws, (root) => {
+    const s = snapshot(ws); requireNoRecovery(s);
+    const old = s.tasks.find(t => t.id === taskId(options.task));
+    if (!old) fail('NOT_FOUND', 'Task not found');
+    if (old.owner !== who) fail('OWNER_MISMATCH', 'Task belongs to another session');
+    if (String(old.rev) !== options['expect-rev']) fail('REVISION_MISMATCH', 'Pass the latest --expect-rev', { actualRev: old.rev });
+    if (!options.to) fail('INVALID', 'migrate requires --to DIRECTORY');
+    const target = artifact(ws, options.to);
+    if (target === old.directory) return { id: old.id, rev: old.rev, directory: portable(ws, old.directory), noChanges: true };
+
+    // The destination must be free. A finished task no longer holds anything,
+    // which is what makes "cancel the wrongly placed task, migrate, continue"
+    // work; a live task's claim is a real conflict and must be handed over.
+    const planned = { ...old, directory: target, writes: [] };
+    const clashes = alertsFor([...s.tasks.filter(t => t.id !== old.id), planned], s.claims).filter(a => a.tasks.includes(old.id));
+    if (clashes.length) fail('RESOURCE_CONFLICT', 'Target directory overlaps another live task', page(clashes.map(a => ({ type: a.type, tasks: a.tasks, path: portable(ws, a.path) })), options));
+    const from = old.directory, moving = Boolean(options['move-files']);
+    if (moving && present(from)) {
+      if (!fs.statSync(from).isDirectory()) fail('INVALID_DIRECTORY', 'Current artifact path is not a directory');
+      if (present(target) && fs.readdirSync(target).length) fail('DIRECTORY_NOT_EMPTY', 'Destination already has content; migrate the record only, or empty it first');
+    }
+    // `writes` are declared resources, not a copy of the directory. Any entry
+    // inside the old directory moves with it; unrelated declarations are kept
+    // byte-for-byte so a migration cannot quietly rewrite someone's claims.
+    const follow = (p) => (inside(from, p) || p === from ? path.join(target, path.relative(from, p)) : p);
+    const writes = [...new Set(old.writes.map(follow))].sort();
+    const record = validateMigrated(ws, { ...old, directory: target, writes, rev: old.rev + 1, updatedAt: new Date().toISOString() });
+    if (moving && present(from)) {
+      const sid = path.join(from, '.session-id');
+      if (present(sid) && fs.readFileSync(sid, 'utf8').trim() !== who) fail('OWNER_MISMATCH', 'Artifact directory has another owner');
+      fs.mkdirSync(target, { recursive: true });
+      for (const entry of fs.readdirSync(from)) {
+        const source = path.join(from, entry), dest = path.join(target, entry);
+        if (present(dest)) fail('DIRECTORY_NOT_EMPTY', `Destination is missing ${entry} but not empty`);
+        fs.renameSync(source, dest);
+      }
+    }
+    const marker = path.join(target, '.session-id');
+    if (present(target) && !present(marker)) {
+      noLink(marker);
+      fs.writeFileSync(marker, who + '\n', { flag: 'wx' });
+    }
+    atomic(path.join(root, 'tasks', old.id + '.json'), record);
+    return { id: record.id, rev: record.rev, state: record.state, from: portable(ws, from), directory: portable(ws, target), moved: moving && present(target), writes: writes.map(p => portable(ws, p)) };
+  });
+}
+/** Run a migrated record through the same normalization as any stored task. */
+function validateMigrated(ws, record) {
+  const { rev, updatedAt, owner, ...body } = record;
+  const normalized = normalizeTask(ws, body, owner);
+  if (!Number.isSafeInteger(rev) || rev < 1 || !Number.isFinite(Date.parse(updatedAt))) fail('REGISTRY_DAMAGED', 'Invalid task revision or timestamp');
+  return { ...normalized, rev, updatedAt };
+}
+
+/**
+ * Drop a finished task record after archiving it.
+ *
+ * `recover-task` is deliberately for child tasks whose owner vanished, which
+ * left the coordinator unable to tidy up its OWN history: a cancelled task it
+ * registered itself could not be cancelled or removed by any command. Those
+ * records accumulate and, before the scan was limited to live tasks, poisoned
+ * `check` permanently. Archiving is the coordinator's own cleanup: it applies to
+ * finished records only (an unfinished task must be cancelled or recovered
+ * first, so that no live claim disappears silently), it copies the record to
+ * `.workspace/archive/` with the time and actor, and it never touches files.
+ */
+function archiveTask(ws, options) {
+  const who = session(options.session, true);
+  return locked(ws, (root) => {
+    const s = snapshot(ws); requireNoRecovery(s);
+    const c = s.config;
+    if (c.main !== who) fail('NOT_MAIN', 'Only the current coordinator can archive task records');
+    const before = s.tasks.find(t => t.id === taskId(options.task));
+    if (!before) fail('NOT_FOUND', 'Task not found');
+    if (String(before.rev) !== options['expect-rev']) fail('REVISION_MISMATCH', 'Pass the latest --expect-rev', { actualRev: before.rev });
+    if (ACTIVE.has(before.state)) fail('INVALID_STATE', 'Cancel or recover the task before archiving; only finished records are history', { state: before.state });
+    if (!text(options.reason, 'archive reason')) fail('INVALID', 'Pass a nonempty --reason');
+    if (readClaims(ws).some(p => p.task === before.id && !['complete', 'cancelled'].includes(p.status))) fail('PENDING_ORGANIZATION', 'Cancel or finish the task organization plans first');
+    const dir = path.join(metadata(ws), 'archive'); noLink(dir);
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const file = path.join(dir, `${before.id}-${stamp}.json`);
+    atomic(file, { schema: 1, archivedAt: new Date().toISOString(), archivedBy: who, reason: options.reason, record: before });
+    fs.unlinkSync(path.join(root, 'tasks', before.id + '.json'));
+    // The directory and its marker are the owner's artifacts, not registry
+    // data: archiving a record must never delete the work it describes.
+    return { id: before.id, archived: `.workspace/archive/${path.basename(file)}`, state: before.state, directory: portable(ws, before.directory), directoryKept: present(before.directory) };
+  });
+}
+
 function scanFiles(ws, tasks) {
   const files = [], issues = [], seen = new Set();
   let bytes = 0, stopped = false;
@@ -512,7 +645,13 @@ function scanFiles(ws, tasks) {
       } else issues.push({ type: 'special_file_not_scanned', path: label });
     } catch (e) { issues.push({ type: e.code === 'ENOENT' ? 'missing_path' : 'read_error', path: label, code: e.code ?? 'ERROR' }); }
   }
-  for (const task of tasks) {
+  // Only live tasks own resources. Scanning finished records made history a
+  // permanent liability: a cancelled task whose directory the user tidied up
+  // produced `owner_unknown` + `missing_path` forever, which blocked `summary`,
+  // which is the only way to establish the `check` baseline — so one deleted
+  // directory disabled both commands for the whole workspace, with no command
+  // able to remove the record that caused it.
+  for (const task of tasks.filter(t => ACTIVE.has(t.state))) {
     if (stopped) break;
     const sid = path.join(task.directory, '.session-id');
     try { noLink(sid); if (fs.readFileSync(sid, 'utf8').trim() !== task.owner) issues.push({ type: 'owner_mismatch', task: task.id }); }
@@ -605,10 +744,10 @@ function owners(ws, options) {
     return { ok: !issues.length, scope: 'registered-directories', owners: page(rows, options), issues: page(issues, options) };
   });
 }
-const HELP = 'Commands: init, task, context, detail, owners, check, summary, handoff, session-check, recover-task. See references/commands.md and references/recovery.md; common: --workspace PATH --session ID. context/check: --limit 1..20 --offset N.';
+const HELP = 'Commands: init, task, migrate, archive, context, detail, owners, check, summary, handoff, session-check, recover-task. See references/commands.md and references/recovery.md; common: --workspace PATH --session ID. context/check: --limit 1..20 --offset N. migrate: --task ID --to DIR --expect-rev N [--move-files]. archive: --task ID --expect-rev N --reason TEXT.';
 function parse(argv) {
   const command = argv[0], options = {};
-  const flags = new Set(['adopt', 'ack-legacy', 'confirm-unavailable']);
+  const flags = new Set(['adopt', 'ack-legacy', 'confirm-unavailable', 'move-files']);
   const allowed = new Set(['workspace', 'session', 'to', 'file', 'task', 'since', 'expect-rev', 'expect-epoch', 'limit', 'offset', 'sessions-home', 'action', 'from', 'reason', 'resume', ...flags]);
   for (let i = 1; i < argv.length; i++) {
     const key = argv[i].startsWith('--') ? argv[i].slice(2) : '';
@@ -642,6 +781,8 @@ export function execute(argv, env) {
   switch (command) {
     case 'init': return init(ws, options);
     case 'task': return register(ws, options);
+    case 'migrate': return migrateTask(ws, options);
+    case 'archive': return archiveTask(ws, options);
     case 'context': return context(ws, options);
     case 'session-check': return checkSessions(ws, options);
     case 'recover-task': return recoverTask(ws, options);

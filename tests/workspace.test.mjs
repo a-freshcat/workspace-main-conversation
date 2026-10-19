@@ -350,3 +350,129 @@ test('the session fallback also reaches mutating commands', () => {
   assert.equal(seen.taskCount, 1);
   assert.equal(seen.tasks.items[0].id, 'task-env');
 });
+
+// ── finished records must not hold the workspace hostage ────────────────────
+// A directory chosen wrongly used to be permanent: `task` refused any change
+// with "explicitly migrate instead" while no migrate command existed, so the
+// documented rule against hanging artifacts off the repository root could not
+// be obeyed once broken. These tests pin both the escape hatch and the limits.
+test('migrating a task directory moves the record, the marker and its own writes', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'misplaced', writes: ['misplaced/notes.md', 'shared.json'] });
+  fs.writeFileSync(path.join(ws, 'misplaced/notes.md'), 'work');
+  fs.writeFileSync(path.join(ws, 'shared.json'), 'shared');
+
+  const moved = run(ws, 'migrate', { session: 'child-a', task: 'task-a', to: 'conversations/task-a', 'expect-rev': 1, 'move-files': true });
+  assert.equal(moved.rev, 2);
+  assert.equal(moved.from, 'misplaced');
+  assert.equal(moved.directory, 'conversations/task-a');
+  // Content followed the move, so the declared resource still describes it.
+  assert.equal(fs.readFileSync(path.join(ws, 'conversations/task-a/notes.md'), 'utf8'), 'work');
+  assert.equal(fs.readFileSync(path.join(ws, 'conversations/task-a/.session-id'), 'utf8').trim(), 'child-a');
+  assert.equal(fs.existsSync(path.join(ws, 'misplaced')), true); // emptied, not deleted
+  // Writes inside the old directory follow it; unrelated declarations do not move.
+  assert.deepEqual(moved.writes, ['conversations/task-a/notes.md', 'shared.json']);
+  // A migration is an ordinary revision: stale callers are still refused.
+  throwsCode(() => run(ws, 'migrate', { session: 'child-a', task: 'task-a', to: 'elsewhere', 'expect-rev': 1 }), 'REVISION_MISMATCH');
+  throwsCode(() => run(ws, 'migrate', { session: 'child-b', task: 'task-a', to: 'elsewhere', 'expect-rev': 2 }), 'OWNER_MISMATCH');
+});
+test('the directory-change error names a command that exists', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'misplaced' });
+  // The reported dead end: updating the same task with a different directory.
+  try {
+    task(ws, 'task-a', 'child-a', { directory: 'conversations/task-a' }, { 'expect-rev': 1 });
+    assert.fail('expected DIRECTORY_CHANGED');
+  } catch (e) {
+    assert.equal(e.code, 'DIRECTORY_CHANGED');
+    // The suggested invocation must actually work, or the message is a lie.
+    const [cmd, ...rest] = e.details.migrate;
+    const args = [cmd];
+    for (let i = 0; i < rest.length; i += 2) args.push(rest[i], String(rest[i + 1]));
+    const after = execute(['migrate', ...args.slice(1)]);
+    assert.equal(after.directory, 'conversations/task-a');
+  }
+});
+test('a live task still blocks the directory a migration targets', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'misplaced' });
+  task(ws, 'task-b', 'child-b', { directory: 'conversations/task-b' });
+  throwsCode(() => run(ws, 'migrate', { session: 'child-a', task: 'task-a', to: 'conversations/task-b', 'expect-rev': 1 }), 'RESOURCE_CONFLICT');
+  throwsCode(() => run(ws, 'migrate', { session: 'child-a', task: 'task-a', to: '../escape', 'expect-rev': 1 }), 'INVALID_DIRECTORY');
+});
+test('a finished task releases its directory, so a cancelled mistake can be repaired', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'conversations/task-a', state: 'cancelled' });
+  // The cancelled record no longer blocks the directory on the registry side.
+  assert.deepEqual(run(ws, 'context', { session: 'main' }).alerts.items.filter(a => a.type === 'directory_overlap'), []);
+  // The ownership marker is a separate lock and still wins: a directory another
+  // conversation marked cannot be claimed by declaring it. That is the operator's
+  // call, not a silent takeover -- the registry stays silent, the marker speaks.
+  throwsCode(() => task(ws, 'task-b', 'child-b', { directory: 'conversations/task-a' }), 'OWNER_MISMATCH');
+  // With the marker gone (the artifacts were discarded with the task), the
+  // released directory is claimable again -- and nothing else complains.
+  fs.rmSync(path.join(ws, 'conversations/task-a'), { recursive: true, force: true });
+  assert.equal(task(ws, 'task-b', 'child-b', { directory: 'conversations/task-a' }).rev, 1);
+  assert.deepEqual(run(ws, 'context', { session: 'main' }).alerts.items, []);
+});
+test('a finished task whose directory was cleared does not block check or summary', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { state: 'done' });
+  task(ws, 'task-b', 'child-b', { state: 'cancelled' });
+  // The user's normal tidy-up: the artifacts are no longer needed.
+  fs.rmSync(path.join(ws, 'conversations/task-a'), { recursive: true, force: true });
+  fs.rmSync(path.join(ws, 'conversations/task-b'), { recursive: true, force: true });
+
+  const checked = run(ws, 'check');
+  assert.equal(checked.alerts.items.some(a => ['owner_unknown', 'missing_path', 'owner_mismatch'].includes(a.type)), false);
+  assert.equal(checked.complete, true);
+  // The baseline this enables is the whole point: it used to be unreachable.
+  assert.equal(run(ws, 'summary', { session: 'main' }).complete, true);
+  assert.equal(run(ws, 'check').ok, true);
+});
+test('editing a finished record does not recreate its deleted directory', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { state: 'cancelled' });
+  fs.rmSync(path.join(ws, 'conversations/task-a'), { recursive: true, force: true });
+  task(ws, 'task-a', 'child-a', { state: 'cancelled', result: '已归档' }, { 'expect-rev': 1 });
+  assert.equal(fs.existsSync(path.join(ws, 'conversations/task-a')), false);
+  // A live task still gets its directory and marker created on demand.
+  task(ws, 'task-b', 'child-b');
+  assert.equal(fs.readFileSync(path.join(ws, 'conversations/task-b/.session-id'), 'utf8').trim(), 'child-b');
+});
+test('a coordinator can archive its own finished record without losing artifacts', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { state: 'cancelled' });
+  fs.writeFileSync(path.join(ws, 'conversations/task-a/keep.txt'), 'do not delete');
+  // Unfinished work cannot be archived away, and a child cannot archive at all.
+  task(ws, 'task-b', 'child-b');
+  throwsCode(() => run(ws, 'archive', { session: 'main', task: 'task-b', 'expect-rev': 1, reason: 'x' }), 'INVALID_STATE');
+  throwsCode(() => run(ws, 'archive', { session: 'child-a', task: 'task-a', 'expect-rev': 1, reason: 'x' }), 'NOT_MAIN');
+  throwsCode(() => run(ws, 'archive', { session: 'main', task: 'task-a', 'expect-rev': 1 }), 'INVALID');
+  throwsCode(() => run(ws, 'archive', { session: 'main', task: 'task-a', 'expect-rev': 9, reason: 'x' }), 'REVISION_MISMATCH');
+
+  const done = run(ws, 'archive', { session: 'main', task: 'task-a', 'expect-rev': 1, reason: '历史记录清理' });
+  assert.equal(done.directoryKept, true);
+  assert.match(done.archived, /^\.workspace\/archive\//);
+  // The record left the registry but its audit and its files survive.
+  assert.equal(fs.existsSync(path.join(ws, '.workspace/tasks/task-a.json')), false);
+  assert.equal(fs.readFileSync(path.join(ws, '.workspace/archive', path.basename(done.archived)), 'utf8').includes('历史记录清理'), true);
+  assert.equal(fs.readFileSync(path.join(ws, 'conversations/task-a/keep.txt'), 'utf8'), 'do not delete');
+  assert.deepEqual(run(ws, 'context', { session: 'main' }).tasks.items.map(t => t.id), ['task-b']);
+});
+test('archiving is what makes a poisoned baseline recoverable end to end', () => {
+  const ws = workspace();
+  // The reported deadlock: a cancelled record pointing at a directory the user
+  // already deleted. summary refused, so the check baseline never appeared.
+  task(ws, 'task-a', 'child-a', { state: 'cancelled' });
+  fs.rmSync(path.join(ws, 'conversations/task-a'), { recursive: true, force: true });
+  assert.equal(run(ws, 'check').ok, false); // baseline_missing, not a scan failure
+  assert.equal(run(ws, 'summary', { session: 'main' }).complete, true);
+  assert.equal(run(ws, 'check').ok, true);
+  const archived = run(ws, 'archive', { session: 'main', task: 'task-a', 'expect-rev': 1, reason: '目录已清理' });
+  assert.equal(archived.state, 'cancelled');
+  // Archiving changes registry state, so the baseline legitimately goes stale,
+  // and is re-established by the next summary — the loop now terminates.
+  run(ws, 'summary', { session: 'main' });
+  assert.equal(run(ws, 'check').ok, true);
+});

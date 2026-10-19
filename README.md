@@ -1,4 +1,4 @@
-# workspace-main-conversation v2.3.0
+# workspace-main-conversation v2.3.1
 
 一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) / Codex skill：
 **让共享工作区里的多个对话不再各干各的、互相撞车。**
@@ -11,6 +11,9 @@
 > 却没登记任务的目录。此前这类对话对统筹完全不可见（`tasks: 0` 和"什么都没干"
 > 长得一模一样），可能让已有产物的对话仍未进入统筹视图。
 > 变更细节见 [re_note.md](re_note.md)。
+> **v2.3.1 起**：任务目录放错不再是死局——`migrate` 提供正当代改口，`archive` 让主对话
+> 能清理自己的终态记录；`check`/`summary` 只扫活动任务，一条指向已删目录的取消记录不会
+> 再让整个工作区的基线永久失效。
 > **v2.3.0 起**：主对话可核实未完成任务所属会话的记录线索，并在用户确认后取消或转交遗留任务；记录缺失不会自动判定会话已删除。
 
 ## 它解决什么问题
@@ -102,6 +105,8 @@ node "$sk\audit-owners.mjs" $ws
 - **主对话**：默认统筹登记任务、处理 alerts、审查冲突与重复劳动；阶段结束用 `summary` 生成 `sum.md`。具体执行任务听从使用者指派，不预设按 bug 大小分工。
 - **子对话**：按使用者指派执行任务，只维护自己的任务记录和产物；需要上下文时优先 `detail --task ID`。
 - **共享写入前**先登记 `writes`；认领冲突则串行交接。
+- **产物目录放错了**：用 `migrate` 改正，不要手工改 `.workspace/tasks/*.json`。`task` 会拒绝静默改目录，但报错里直接给出可执行的 `migrate` 调用。
+- **终态任务堆积或目录已被清理**：主对话用 `archive` 归档自己的 done/cancelled 记录。已取消/已完成的任务不占用资源，`check`/`summary` 不再因为它们扫到已删目录而永久失效。
 - **子对话被删或不可恢复**：主对话先核实，再按用户指派取消或转交遗留任务；会话记录检查只给线索。见 [会话检查与任务恢复](references/recovery.md)。
 - 详细命令见 [references/commands.md](references/commands.md)；
   整理散落产物见 [references/organize.md](references/organize.md)；

@@ -1,4 +1,4 @@
-# workspace-main-conversation v2.3.1
+# workspace-main-conversation v2.3.2
 
 一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) / Codex skill：
 **让共享工作区里的多个对话不再各干各的、互相撞车。**

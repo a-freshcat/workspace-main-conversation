@@ -369,12 +369,7 @@ function register(ws, options) {
     // `result` text resurrected an empty shell, so cleanup could never stay done.
     // Ownership is still verified for a directory that happens to exist.
     const hasLiveDirectory = !old || ACTIVE.has(old.state) || ACTIVE.has(current.state);
-    if (present(current.directory)) {
-      if (!fs.statSync(current.directory).isDirectory()) fail('INVALID_DIRECTORY', 'Artifact path is not a directory');
-      noLink(sid);
-      if (present(sid) && fs.readFileSync(sid, 'utf8').trim() !== who) fail('OWNER_MISMATCH', 'Artifact directory has another owner');
-      if (!present(sid) && fs.readdirSync(current.directory).length && !options.adopt) fail('ADOPTION_REQUIRED', 'Existing nonempty directory needs confirmed ownership and --adopt');
-    }
+    claimDirectory(ws, current.directory, who, options);
     if (hasLiveDirectory) {
       fs.mkdirSync(current.directory, { recursive: true });
       if (!present(sid)) fs.writeFileSync(sid, who + '\n', { flag: 'wx' });
@@ -508,6 +503,30 @@ function recoverTask(ws, options) {
 }
 
 /**
+ * Take ownership of an artifact directory that already exists.
+ *
+ * `register` and `migrate` both hand a conversation a directory, and both must
+ * apply the same three rules or one of them becomes a way around the other:
+ *   1. a marker written by another conversation is a hard stop (`OWNER_MISMATCH`)
+ *      -- a marker is a claim of authorship, not a suggestion;
+ *   2. content the tool has never seen adopted needs explicit `--adopt`
+ *      (`ADOPTION_REQUIRED`), so no one silently absorbs someone else's work;
+ *   3. metadata paths and links are refused.
+ *
+ * This used to live inline in `register` only, which is exactly how `migrate`
+ * came to accept another conversation's directory and to absorb an unmarked
+ * non-empty one without confirmation.
+ */
+function claimDirectory(ws, dir, who, options) {
+  const sid = path.join(dir, '.session-id');
+  if (!present(dir)) return sid;
+  if (!fs.statSync(dir).isDirectory()) fail('INVALID_DIRECTORY', 'Artifact path is not a directory');
+  noLink(sid);
+  if (present(sid) && fs.readFileSync(sid, 'utf8').trim() !== who) fail('OWNER_MISMATCH', 'Artifact directory has another owner');
+  if (!present(sid) && fs.readdirSync(dir).length && !options.adopt) fail('ADOPTION_REQUIRED', 'Existing nonempty directory needs confirmed ownership and --adopt');
+  return sid;
+}
+/**
  * Move a task's artifact directory.
  *
  * Registration freezes `directory` so that a task cannot silently drift away
@@ -517,14 +536,16 @@ function recoverTask(ws, options) {
  * because the only repair was hand-editing the registry.
  *
  * The freeze therefore stays, and this is the explicit unfreeze. It is
- * deliberately narrower than a re-registration:
- *   - the new directory must be a legal artifact path, and free of any *live*
- *     task's claim (a finished task releases its directory);
- *   - `writes` are rewritten to follow the move, so an owner that declared
- *     "my whole directory" keeps claiming it afterwards;
- *   - the ownership marker travels with the content; content is only moved
- *     when the caller confirms `--move-files`, and only when the destination
- *     does not already hold something.
+ * deliberately no more permissive than a re-registration would be:
+ *   - the target must clear the same ownership/adoption rules as `register`
+ *     (`claimDirectory`), or migration becomes the way around them;
+ *   - the *finished* record must be conflict-free. `--move-files` additionally
+ *     relocates resource claims that the new directory creates, so those must be
+ *     free too; without it no file moves and those claims stay with the old path;
+ *   - `writes` inside the old directory are rewritten to follow the move, and
+ *     must not collide with a live task once rewritten;
+ *   - content is only moved with `--move-files`, and only into a destination
+ *     that is empty.
  *
  * @returns The new revision, both directories, and whether files were moved.
  */
@@ -539,23 +560,27 @@ function migrateTask(ws, options) {
     if (!options.to) fail('INVALID', 'migrate requires --to DIRECTORY');
     const target = artifact(ws, options.to);
     if (target === old.directory) return { id: old.id, rev: old.rev, directory: portable(ws, old.directory), noChanges: true };
+    // Same ownership and adoption gate as `register`: a migration must not be a
+    // way to take a marked directory or to absorb unadopted content.
+    claimDirectory(ws, target, who, options);
 
-    // The destination must be free. A finished task no longer holds anything,
-    // which is what makes "cancel the wrongly placed task, migrate, continue"
-    // work; a live task's claim is a real conflict and must be handed over.
-    const planned = { ...old, directory: target, writes: [] };
-    const clashes = alertsFor([...s.tasks.filter(t => t.id !== old.id), planned], s.claims).filter(a => a.tasks.includes(old.id));
-    if (clashes.length) fail('RESOURCE_CONFLICT', 'Target directory overlaps another live task', page(clashes.map(a => ({ type: a.type, tasks: a.tasks, path: portable(ws, a.path) })), options));
     const from = old.directory, moving = Boolean(options['move-files']);
-    if (moving && present(from)) {
-      if (!fs.statSync(from).isDirectory()) fail('INVALID_DIRECTORY', 'Current artifact path is not a directory');
-      if (present(target) && fs.readdirSync(target).length) fail('DIRECTORY_NOT_EMPTY', 'Destination already has content; migrate the record only, or empty it first');
-    }
     // `writes` are declared resources, not a copy of the directory. Any entry
     // inside the old directory moves with it; unrelated declarations are kept
     // byte-for-byte so a migration cannot quietly rewrite someone's claims.
     const follow = (p) => (inside(from, p) || p === from ? path.join(target, path.relative(from, p)) : p);
     const writes = [...new Set(old.writes.map(follow))].sort();
+    // Conflicts are judged on what the migrated record will actually claim.
+    // Checking a version with `writes: []` only caught directory overlaps, so a
+    // rewritten path could land on a live task's claim and write an overlap that
+    // `register` would have refused (`migrate` became a hole in the check).
+    const planned = { ...old, directory: target, writes };
+    const clashes = alertsFor([...s.tasks.filter(t => t.id !== old.id), planned], s.claims).filter(a => a.tasks.includes(old.id));
+    if (clashes.length) fail('RESOURCE_CONFLICT', 'Target directory or rewritten writes overlap another live task', page(clashes.map(a => ({ type: a.type, tasks: a.tasks, path: portable(ws, a.path), ...(a.otherPath ? { otherPath: portable(ws, a.otherPath) } : {}) })), options));
+    if (moving && present(from)) {
+      if (!fs.statSync(from).isDirectory()) fail('INVALID_DIRECTORY', 'Current artifact path is not a directory');
+      if (present(target) && fs.readdirSync(target).length) fail('DIRECTORY_NOT_EMPTY', 'Destination already has content; migrate the record only, or empty it first');
+    }
     const record = validateMigrated(ws, { ...old, directory: target, writes, rev: old.rev + 1, updatedAt: new Date().toISOString() });
     if (moving && present(from)) {
       const sid = path.join(from, '.session-id');

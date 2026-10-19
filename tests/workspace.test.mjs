@@ -393,12 +393,57 @@ test('the directory-change error names a command that exists', () => {
     assert.equal(after.directory, 'conversations/task-a');
   }
 });
+// A migration must not become the way around the rules `register` enforces.
+// It used to check only directory overlap -- against a version of the record
+// with no writes at all -- so it accepted targets that `register` itself
+// refused, and could even write a resource overlap that `register` would have
+// rejected. These four tests pin each gate.
 test('a live task still blocks the directory a migration targets', () => {
   const ws = workspace();
   task(ws, 'task-a', 'child-a', { directory: 'misplaced' });
   task(ws, 'task-b', 'child-b', { directory: 'conversations/task-b' });
-  throwsCode(() => run(ws, 'migrate', { session: 'child-a', task: 'task-a', to: 'conversations/task-b', 'expect-rev': 1 }), 'RESOURCE_CONFLICT');
+  // The live owner's marker stops it even earlier than the overlap check; both
+  // are refusals, so accept whichever gate answers first.
+  assert.throws(() => run(ws, 'migrate', { session: 'child-a', task: 'task-a', to: 'conversations/task-b', 'expect-rev': 1 }),
+    e => ['RESOURCE_CONFLICT', 'OWNER_MISMATCH'].includes(e.code));
   throwsCode(() => run(ws, 'migrate', { session: 'child-a', task: 'task-a', to: '../escape', 'expect-rev': 1 }), 'INVALID_DIRECTORY');
+});
+test('a migration cannot take a directory marked by another conversation', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'misplaced' });
+  fs.mkdirSync(path.join(ws, 'theirs'));
+  fs.writeFileSync(path.join(ws, 'theirs', '.session-id'), 'child-b' + String.fromCharCode(10));
+  // Same gate as register: a marker is a claim of authorship, not a suggestion.
+  throwsCode(() => run(ws, 'migrate', { session: 'child-a', task: 'task-a', to: 'theirs', 'expect-rev': 1 }), 'OWNER_MISMATCH');
+  throwsCode(() => task(ws, 'task-b', 'child-a', { directory: 'theirs' }), 'OWNER_MISMATCH');
+});
+test('a migration cannot absorb an unmarked nonempty directory without --adopt', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'misplaced' });
+  fs.mkdirSync(path.join(ws, 'orphan'));
+  fs.writeFileSync(path.join(ws, 'orphan', 'data.txt'), 'someone else');
+  throwsCode(() => run(ws, 'migrate', { session: 'child-a', task: 'task-a', to: 'orphan', 'expect-rev': 1 }), 'ADOPTION_REQUIRED');
+  // The same explicit confirmation that register requires also unlocks migrate,
+  // and it writes the same ownership marker.
+  const moved = run(ws, 'migrate', { session: 'child-a', task: 'task-a', to: 'orphan', 'expect-rev': 1, adopt: true });
+  assert.equal(moved.directory, 'orphan');
+  assert.equal(fs.readFileSync(path.join(ws, 'orphan/.session-id'), 'utf8').trim(), 'child-a');
+});
+test('rewritten writes cannot land on a live task claim', () => {
+  const ws = workspace();
+  // `task-a` declares a file inside its directory; migrating rewrites that
+  // declaration to follow the move, and the rewritten path is already claimed.
+  task(ws, 'task-a', 'child-a', { directory: 'misplaced', writes: ['misplaced/report.md'] });
+  task(ws, 'task-b', 'child-b', { directory: 'conversations/other', writes: ['conversations/shared/report.md'] });
+  throwsCode(() => run(ws, 'migrate', { session: 'child-a', task: 'task-a', to: 'conversations/shared', 'expect-rev': 1 }), 'RESOURCE_CONFLICT');
+  // Nothing was written: the record still describes where it really is.
+  // Canonical paths round-trip through the 8.3 short name on Windows, so compare
+  // the trailing segment rather than an exact absolute path.
+  assert.equal(run(ws, 'detail', { task: 'task-a' }).directory.toLowerCase().endsWith('misplaced'), true);
+  // An unrelated declaration that does not move is still free, so a migration
+  // is only refused for the claims it would actually create.
+  const moved = run(ws, 'migrate', { session: 'child-a', task: 'task-a', to: 'conversations/free', 'expect-rev': 1 });
+  assert.equal(moved.directory, 'conversations/free');
 });
 test('a finished task releases its directory, so a cancelled mistake can be repaired', () => {
   const ws = workspace();

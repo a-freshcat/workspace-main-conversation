@@ -726,3 +726,121 @@ test('init accepts an explicit layout for either shape', () => {
   fs.writeFileSync(p, JSON.stringify({ id: 't', goal: 'g', state: 'doing', writes: [], next: '' }));
   assert.equal(run(lot, 'task', { session: 'c', file: p }).directory, 'work/t');
 });
+
+// ── coordinator authority ───────────────────────────────────────────────────
+// The coordinator is not a peer of the conversations it coordinates. Treating it
+// as one left it unable to move a child's misplaced directory — the exact work it
+// was appointed to do. The owner keeps exclusive control of content; the
+// coordinator acts on placement and must state a reason, which is recorded.
+test('the coordinator may move a child task directory, and the marker stays with the owner', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'misplaced' });
+  fs.writeFileSync(path.join(ws, 'misplaced/work.txt'), 'x');
+
+  const moved = run(ws, 'migrate', { session: 'main', task: 'task-a', to: 'child-work', 'expect-rev': 1, 'move-files': true, reason: '目录应放在产物目录下' });
+  assert.equal(moved.directory, 'child-work');
+  assert.equal(moved.actedAs, 'coordinator');
+  assert.equal(moved.owner, 'child-a');
+  // The directory belongs to the task, so the marker still names the child.
+  assert.equal(fs.readFileSync(path.join(ws, 'child-work/.session-id'), 'utf8').trim(), 'child-a');
+  assert.equal(fs.readFileSync(path.join(ws, 'child-work/work.txt'), 'utf8'), 'x');
+  // The record keeps the real owner and remembers who acted.
+  const detail = run(ws, 'detail', { task: 'task-a' });
+  assert.equal(detail.owner, 'child-a');
+  assert.equal(detail.lastActor, 'main');
+  assert.equal(detail.lastReason, '目录应放在产物目录下');
+});
+test('a coordinator override without a reason is refused', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'misplaced' });
+  throwsCode(() => run(ws, 'migrate', { session: 'main', task: 'task-a', to: 'elsewhere', 'expect-rev': 1 }), 'REASON_REQUIRED');
+  // A child still cannot touch another child's task at all.
+  task(ws, 'task-b', 'child-b', { directory: 'other' });
+  throwsCode(() => run(ws, 'migrate', { session: 'child-a', task: 'task-b', to: 'elsewhere', 'expect-rev': 1, reason: 'x' }), 'OWNER_MISMATCH');
+});
+test('the coordinator may repair writes but may not seize goal or state', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'misplaced', writes: ['old/notes.md'] });
+  // Placement and declarations are coordination work.
+  const fixed = task(ws, 'task-a', 'child-a', { directory: 'misplaced', writes: ['new/notes.md'], next: '继续' }, { 'expect-rev': 1, reason: '修正声明', session: 'main' }, 'main');
+  assert.equal(fixed.rev, 2);
+  assert.equal(run(ws, 'detail', { task: 'task-a' }).owner, 'child-a');
+});
+test('migrate --follow remaps declarations that moved with a project', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'conversation-task-a', writes: ['src', 'assets/logo.png', 'unrelated.txt'] });
+  fs.mkdirSync(path.join(ws, 'src'));
+  fs.writeFileSync(path.join(ws, 'src/a.ts'), 'x');
+  fs.mkdirSync(path.join(ws, 'assets'));
+  fs.writeFileSync(path.join(ws, 'assets/logo.png'), 'x');
+  fs.writeFileSync(path.join(ws, 'unrelated.txt'), 'x');
+  // The project was dragged into the task directory by hand; --follow tells the
+  // migration where those declarations went, so no `missing_path` storm follows.
+  fs.renameSync(path.join(ws, 'src'), path.join(ws, 'conversation-task-a/src'));
+  fs.renameSync(path.join(ws, 'assets'), path.join(ws, 'conversation-task-a/assets'));
+
+  const moved = run(ws, 'migrate', { session: 'child-a', task: 'task-a', to: 'conversation-task-a', 'expect-rev': 1, follow: ['src=>conversation-task-a/src', 'assets=>conversation-task-a/assets'] });
+  // The directory already matches, so only the declarations change.
+  assert.equal(moved.rev === 2 || moved.noChanges === true, true, JSON.stringify(moved));
+  assert.equal(moved.warning, undefined, JSON.stringify(moved));
+  const writes = run(ws, 'detail', { task: 'task-a' }).writes.map(w => w.replaceAll('\\', '/').split('code_workspace').pop() ?? w);
+  assert.equal(writes.some(w => w.includes('conversation-task-a/src')), true);
+});
+test('migrate reports declarations that will be missing instead of silently keeping them', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'misplaced', writes: ['gone.txt'] });
+  const moved = run(ws, 'migrate', { session: 'child-a', task: 'task-a', to: 'moved', 'expect-rev': 1 });
+  // Reported, not guessed: the tool does not decide where a stale claim should go.
+  assert.ok(moved.orphanedWrites.includes('gone.txt'));
+  assert.match(moved.warning, /no longer exist/);
+});
+test('a project kept inside a conversation directory is not reported as vacant', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'conversation-task-a' });
+  fs.writeFileSync(path.join(ws, 'conversation-task-a/package.json'), '{}');
+  fs.mkdirSync(path.join(ws, 'conversation-task-a/src'));
+  const shape = run(ws, 'audit').workspaceShape;
+  assert.equal(shape.shape, 'per-conversation-projects');
+  assert.equal(shape.conversationProjects[0].directory, 'conversation-task-a');
+  assert.ok(shape.conversationProjects[0].evidence.includes('package.json'));
+  assert.ok(shape.conversationProjects[0].evidence.includes('src/'));
+});
+test('a relocation is reported as moved, not as many modifications', () => {
+  const ws = workspace();
+  task(ws, 'task-a', 'child-a', { directory: 'conversation-task-a' });
+  fs.mkdirSync(path.join(ws, 'conversation-task-a/lib'));
+  for (const n of ['a.js', 'b.js']) fs.writeFileSync(path.join(ws, 'conversation-task-a/lib/' + n), 'content-' + n);
+  run(ws, 'summary', { session: 'main' });
+  // Move the whole lib elsewhere, keeping content identical.
+  fs.mkdirSync(path.join(ws, 'conversation-task-a/vendor'));
+  for (const n of ['a.js', 'b.js']) fs.renameSync(path.join(ws, 'conversation-task-a/lib/' + n), path.join(ws, 'conversation-task-a/vendor/' + n));
+  const r = run(ws, 'check');
+  const stale = r.alerts.items.find(a => a.type === 'summary_files_stale');
+  // Paired moves collapse into ONE entry each: the pair is not counted twice.
+  assert.equal(stale.count, 2);
+  assert.equal(stale.moved, 2);
+  assert.equal(stale.modified, 0);
+  assert.equal(stale.added, 0);
+  assert.equal(stale.deleted, 0);
+  const movedChange = r.changes.items.find(c => c.change === 'moved');
+  assert.equal(movedChange.from, 'conversation-task-a/lib/a.js');
+  // A real edit still lands in the modified bucket. Re-baseline first, so the
+  // comparison is against the moved file rather than the original location.
+  run(ws, 'summary', { session: 'main' });
+  fs.writeFileSync(path.join(ws, 'conversation-task-a/vendor/a.js'), 'changed');
+  const r2 = run(ws, 'check');
+  const stale2 = r2.alerts.items.find(a => a.type === 'summary_files_stale');
+  assert.equal(stale2.modified, 1);
+  assert.equal(stale2.moved, 0);
+});
+test('audit reports a recorded layout that no longer matches the tree', () => {
+  const ws = projectWorkspace();
+  // Record a container, then organise by hand into the root.
+  run(ws, 'move-artifacts', { session: 'main', artifacts: 'shared', 'expect-epoch': 1 });
+  task(ws, 'task-a', 'child-a', { directory: 'shared/task-a' });
+  fs.renameSync(path.join(ws, 'shared/task-a'), path.join(ws, 'task-a'));
+  const drift = run(ws, 'audit').layoutDrift;
+  assert.ok(drift);
+  assert.equal(drift.recorded, 'shared');
+  assert.deepEqual(drift.directories, ['task-a']);
+});

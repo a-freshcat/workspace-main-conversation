@@ -3,7 +3,7 @@ name: workspace-main-conversation
 description: 管理共享工作区的对话分工、文件归属与认领归拢；进入已启用的工作区、共享写入或整理散落产物时使用。
 ---
 
-# 工作区协作 v2.4.2
+# 工作区协作 v2.4.3
 
 目标：用少量状态支持协作，细节按需读取。具体任务分工以用户指派为准。脚本路径相对本 skill 目录；工作区参数用绝对路径。适用于 Codex 和 DSH。
 
@@ -30,6 +30,7 @@ CLI 会自己读 `DSH_SESSION_ID` 兜底，所以在 `pwsh` 下不传 `--session
 - 共享写入前先登记 `writes`；认领冲突则串行交接。`check` 核对已登记路径，编辑前重读目标文件。
 - `context` 报 `undeclaredCount` 时说明有没被任何任务声明的文件，值得跑一次 `audit` 盘点（只读）。未声明文件不是错误，不会让 `check` 失败；公共项目文件属于项目基线，不要因为未声明就搬进个人目录。
 - 产物目录默认平铺在根目录，名字用任务 id，不加前缀不套容器。需要集中到容器才用 `init --artifacts NAME` 或 `move-artifacts`（仅主对话）。
+- 主对话可以搬动或修正任何任务的**位置与写入声明**（需 `--reason`，会记进 `lastActor`/`lastReason`），但不能改别人的目标与状态；内容始终归 owner。
 - `sum.md` 由主对话脚本生成；子对话更新各自记录。相同内容不增加任务版本。
 - 主对话重新分派前看 `sessionCheck` 与 alerts；出现 `owner_record_missing`、用户告知子对话已删除，或需要接管遗留任务时，读 [会话检查与任务恢复](references/recovery.md)。记录缺失只提示核实；用户确认原 owner 不可用后，主对话才能取消或转交已登记任务。
 

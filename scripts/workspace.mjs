@@ -40,11 +40,28 @@ function shapeOf(ws) {
   const dirs = PROJECT_DIRS.filter(n => { const f = path.join(ws, n); try { return present(f) && fs.statSync(f).isDirectory(); } catch { return false; } });
   const project = markers.length > 0 || dirs.length > 0;
   const loose = conversationDirectories(ws);
+  // A project does not have to sit in the workspace root. Conversations commonly
+  // keep a whole project inside their own artifact directory, and reporting that
+  // as "vacant" told the next reader the opposite of the truth: that the root was
+  // empty ground where anything could be created. One level is enough to tell
+  // the two apart, and it is the level the registry already names.
+  const nested = loose.map(d => ({ directory: d, evidence: projectEvidence(d) })).filter(x => x.evidence.length);
+  const shape = project ? (loose.length ? 'mixed' : 'project') : nested.length ? 'per-conversation-projects' : 'vacant';
   return {
-    shape: project ? (loose.length ? 'mixed' : 'project') : 'vacant',
+    shape,
     evidence: [...markers, ...dirs.map(d => d + '/')],
     flatConversationDirectories: loose.map(d => portable(ws, d)),
+    ...(nested.length ? { conversationProjects: nested.map(x => ({ directory: portable(ws, x.directory), evidence: x.evidence })) } : {}),
   };
+}
+/** Project markers found directly inside one directory. */
+function projectEvidence(dir) {
+  const out = PROJECT_MARKERS.filter(n => present(path.join(dir, n)));
+  for (const n of PROJECT_DIRS) {
+    const f = path.join(dir, n);
+    try { if (present(f) && fs.statSync(f).isDirectory()) out.push(n + '/'); } catch { /* ignore */ }
+  }
+  return out;
 }
 /** Directories in the workspace root that look like a conversation artifact dir. */
 function conversationDirectories(ws) {
@@ -174,7 +191,7 @@ const overlaps = (a, b) => a === b || inside(a, b) || inside(b, a);
 function defaultDirectory(id, root) { return root ? `${root}/${id}` : id; }
 function normalizeTask(ws, input, owner) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('INVALID', 'Task must be an object');
-  const allowed = new Set(['id', 'goal', 'state', 'directory', 'writes', 'next', 'result', 'evidence']);
+  const allowed = new Set(['id', 'goal', 'state', 'directory', 'writes', 'next', 'result', 'evidence', 'lastActor', 'lastReason']);
   if (Object.keys(input).some(k => !allowed.has(k))) fail('INVALID', 'Unknown task fields');
   const id = taskId(input.id);
   const goal = text(input.goal, 'goal');
@@ -193,7 +210,9 @@ function normalizeTask(ws, input, owner) {
   const evidence = input.evidence ?? [];
   if (!Array.isArray(evidence) || evidence.length > 20) fail('INVALID', 'evidence must contain at most 20 references');
   evidence.forEach(e => text(e, 'evidence reference', 1024));
-  return { id, owner, goal, state: input.state, directory, writes, next: text(input.next ?? '', 'next'), result: text(input.result ?? '', 'result', 800), evidence };
+  const lastActor = input.lastActor === undefined ? '' : text(input.lastActor, 'lastActor', 160);
+  const lastReason = input.lastReason === undefined ? '' : text(input.lastReason, 'lastReason', 400);
+  return { id, owner, goal, state: input.state, directory, writes, next: text(input.next ?? '', 'next'), result: text(input.result ?? '', 'result', 800), evidence, ...(lastActor ? { lastActor, lastReason } : {}) };
 }
 function readTasks(ws) {
   const dir = path.join(metadata(ws), 'tasks');
@@ -434,7 +453,14 @@ function register(ws, options) {
   return locked(ws, root => {
     const s = snapshot(ws); requireNoRecovery(s);
     const current = normalizeTask(ws, input, who), old = s.tasks.find(t => t.id === current.id);
-    if (old && old.owner !== who) fail('OWNER_MISMATCH', 'Task belongs to another session');
+    // The coordinator may repair placement and declarations of any task, but it
+    // must not seize one: the recorded owner stays whoever is doing the work.
+    const actor = old ? authority(s, old, who, options) : 'owner';
+    if (old && actor === 'coordinator') {
+      if (current.goal !== old.goal) fail('INVALID', 'The coordinator may change placement and writes, not another session\'s goal');
+      if (current.state !== old.state) fail('INVALID', 'The coordinator may change placement and writes, not another session\'s state; use recover-task to cancel or reassign');
+    }
+    const ownerOf = old ? old.owner : who;
     if (old && String(old.rev) !== options['expect-rev']) fail('REVISION_MISMATCH', 'Pass the latest --expect-rev', { actualRev: old.rev });
     if (!old && options['expect-rev'] !== undefined) fail('REVISION_MISMATCH', 'New task has no prior revision');
     // A directory chosen wrongly used to be unrecoverable: the error told the
@@ -457,12 +483,12 @@ function register(ws, options) {
     // `result` text resurrected an empty shell, so cleanup could never stay done.
     // Ownership is still verified for a directory that happens to exist.
     const hasLiveDirectory = !old || ACTIVE.has(old.state) || ACTIVE.has(current.state);
-    claimDirectory(ws, current.directory, who, options);
+    claimDirectory(ws, current.directory, ownerOf, options);
     if (hasLiveDirectory) {
       fs.mkdirSync(current.directory, { recursive: true });
-      if (!present(sid)) fs.writeFileSync(sid, who + '\n', { flag: 'wx' });
+      if (!present(sid)) fs.writeFileSync(sid, ownerOf + '\n', { flag: 'wx' });
     }
-    const record = { ...current, rev: (old?.rev ?? 0) + 1, updatedAt: new Date().toISOString() };
+    const record = { ...current, owner: ownerOf, rev: (old?.rev ?? 0) + 1, updatedAt: new Date().toISOString(), ...(actor === 'coordinator' ? { lastActor: who, lastReason: options.reason } : {}) };
     atomic(path.join(root, 'tasks', current.id + '.json'), record);
     return { id: record.id, rev: record.rev, state: record.state, directory: portable(ws, record.directory) };
   });
@@ -605,12 +631,49 @@ function recoverTask(ws, options) {
  * came to accept another conversation's directory and to absorb an unmarked
  * non-empty one without confirmation.
  */
-function claimDirectory(ws, dir, who, options) {
+/**
+ * Who may change a task, and on what authority.
+ *
+ * Two roles act on a task record: its **owner** (the conversation doing the work)
+ * and the **coordinator** (the conversation responsible for the whole workspace).
+ * Treating them as peers was a mistake: it left the coordinator unable to move a
+ * child's misplaced directory or correct its declarations, even though that is
+ * exactly the coordination it was appointed to do.
+ *
+ * The owner keeps exclusive control of *content* — nobody else may rewrite the
+ * goal, next step or result of work they are not doing. The coordinator may act
+ * on *placement and metadata* (directory, writes) so it can resolve the messes it
+ * is asked to resolve. Every coordinator action is recorded in the task record as
+ * `lastActor`, so the audit trail never loses track of who touched what.
+ *
+ * @returns 'owner' or 'coordinator', or throws when neither applies.
+ */
+function authority(s, task, who, options) {
+  if (task.owner === who) return 'owner';
+  if (s.config.main !== who) fail('OWNER_MISMATCH', 'Task belongs to another session');
+  // A coordinator moving someone else's work must say why. This is the only
+  // friction added: it makes the override deliberate instead of accidental,
+  // and it lands verbatim in the record for the owner to read later.
+  if (!options.reason) fail('REASON_REQUIRED', 'A coordinator acting on another session\'s task must pass --reason explaining the change');
+  text(options.reason, 'coordinator reason', 400);
+  return 'coordinator';
+}
+/**
+ * The session a directory must belong to.
+ *
+ * Ownership of an artifact directory follows the *task*, not whoever happens to
+ * run the command: when the coordinator moves a child's directory, the marker
+ * inside it must still name the child. Checking against the actor here is what
+ * made coordinator migrations impossible.
+ */
+function directoryOwnerOf(task) { return task.owner; }
+
+function claimDirectory(ws, dir, expected, options) {
   const sid = path.join(dir, '.session-id');
   if (!present(dir)) return sid;
   if (!fs.statSync(dir).isDirectory()) fail('INVALID_DIRECTORY', 'Artifact path is not a directory');
   noLink(sid);
-  if (present(sid) && fs.readFileSync(sid, 'utf8').trim() !== who) fail('OWNER_MISMATCH', 'Artifact directory has another owner');
+  if (present(sid) && fs.readFileSync(sid, 'utf8').trim() !== expected) fail('OWNER_MISMATCH', 'Artifact directory has another owner');
   if (!present(sid) && fs.readdirSync(dir).length && !options.adopt) fail('ADOPTION_REQUIRED', 'Existing nonempty directory needs confirmed ownership and --adopt');
   return sid;
 }
@@ -643,21 +706,47 @@ function migrateTask(ws, options) {
     const s = snapshot(ws); requireNoRecovery(s);
     const old = s.tasks.find(t => t.id === taskId(options.task));
     if (!old) fail('NOT_FOUND', 'Task not found');
-    if (old.owner !== who) fail('OWNER_MISMATCH', 'Task belongs to another session');
+    const actor = authority(s, old, who, options);
     if (String(old.rev) !== options['expect-rev']) fail('REVISION_MISMATCH', 'Pass the latest --expect-rev', { actualRev: old.rev });
     if (!options.to) fail('INVALID', 'migrate requires --to DIRECTORY');
     const target = artifact(ws, options.to);
-    if (target === old.directory) return { id: old.id, rev: old.rev, directory: portable(ws, old.directory), noChanges: true };
-    // Same ownership and adoption gate as `register`: a migration must not be a
-    // way to take a marked directory or to absorb unadopted content.
-    claimDirectory(ws, target, who, options);
+    const sameDirectory = target === old.directory;
+    if (sameDirectory && !options.follow) return { id: old.id, rev: old.rev, directory: portable(ws, old.directory), noChanges: true };
+    // The directory belongs to the task, not to whoever runs the command: when
+    // the coordinator moves a child's directory the marker must still name the
+    // child. Same ownership and adoption gate as `register`.
+    if (!sameDirectory) claimDirectory(ws, target, directoryOwnerOf(old), options);
 
-    const from = old.directory, moving = Boolean(options['move-files']);
-    // `writes` are declared resources, not a copy of the directory. Any entry
-    // inside the old directory moves with it; unrelated declarations are kept
-    // byte-for-byte so a migration cannot quietly rewrite someone's claims.
-    const follow = (p) => (inside(from, p) || p === from ? path.join(target, path.relative(from, p)) : p);
+    const from = old.directory, moving = Boolean(options['move-files']) && !sameDirectory;
+    // `writes` are declared resources, not a copy of the directory. Entries
+    // inside the old directory follow it, and so do entries that were physically
+    // moved into it: a project that lived in the workspace root and was then
+    // dragged inside a task directory leaves every declaration pointing at the
+    // old location, which used to surface as dozens of `missing_path` alerts with
+    // no hint about the cause. `--follow` paths map old -> new explicitly.
+    const followMap = new Map();
+    for (const pair of options.follow ?? []) {
+      const [a, b] = String(pair).split('=>');
+      if (!a || !b) fail('INVALID', 'Each --follow takes OLD=>NEW');
+      followMap.set(canonical(ws, a), canonical(ws, b));
+    }
+    const follow = (q) => {
+      if (inside(from, q) || q === from) return path.join(target, path.relative(from, q));
+      for (const [a, b] of followMap) if (q === a || inside(a, q)) return path.join(b, path.relative(a, q));
+      return q;
+    };
     const writes = [...new Set(old.writes.map(follow))].sort();
+    // Predict what will be missing after the move so the caller is not left
+    // guessing from a wall of check alerts. Reported, never silently "fixed":
+    // guessing that a declaration *should* point somewhere is how claims rot.
+    const willExist = (q) => {
+      if (followMap.size || moving) {
+        for (const [a, b] of followMap) if (q === a || inside(a, q)) return present(path.join(b, path.relative(a, q)));
+        if (inside(from, q) || q === from) return present(path.join(target, path.relative(from, q)));
+      }
+      return present(q);
+    };
+    const orphanedWrites = old.writes.filter(q => !willExist(follow(q))).map(q => portable(ws, q));
     // Conflicts are judged on what the migrated record will actually claim.
     // Checking a version with `writes: []` only caught directory overlaps, so a
     // rewritten path could land on a live task's claim and write an overlap that
@@ -669,10 +758,10 @@ function migrateTask(ws, options) {
       if (!fs.statSync(from).isDirectory()) fail('INVALID_DIRECTORY', 'Current artifact path is not a directory');
       if (present(target) && fs.readdirSync(target).length) fail('DIRECTORY_NOT_EMPTY', 'Destination already has content; migrate the record only, or empty it first');
     }
-    const record = validateMigrated(ws, { ...old, directory: target, writes, rev: old.rev + 1, updatedAt: new Date().toISOString() });
+    const record = validateMigrated(ws, { ...old, directory: target, writes, rev: old.rev + 1, updatedAt: new Date().toISOString(), ...(actor === 'coordinator' ? { lastActor: who, lastReason: options.reason } : {}) });
     if (moving && present(from)) {
       const sid = path.join(from, '.session-id');
-      if (present(sid) && fs.readFileSync(sid, 'utf8').trim() !== who) fail('OWNER_MISMATCH', 'Artifact directory has another owner');
+      if (present(sid) && fs.readFileSync(sid, 'utf8').trim() !== directoryOwnerOf(old)) fail('OWNER_MISMATCH', 'Artifact directory has another owner');
       fs.mkdirSync(target, { recursive: true });
       for (const entry of fs.readdirSync(from)) {
         const source = path.join(from, entry), dest = path.join(target, entry);
@@ -686,7 +775,13 @@ function migrateTask(ws, options) {
       fs.writeFileSync(marker, who + '\n', { flag: 'wx' });
     }
     atomic(path.join(root, 'tasks', old.id + '.json'), record);
-    return { id: record.id, rev: record.rev, state: record.state, from: portable(ws, from), directory: portable(ws, target), moved: moving && present(target), writes: writes.map(p => portable(ws, p)) };
+    return {
+      id: record.id, rev: record.rev, state: record.state,
+      from: portable(ws, from), directory: portable(ws, target),
+      moved: moving && present(target), writes: writes.map(q => portable(ws, q)),
+      ...(actor === 'coordinator' ? { actedAs: 'coordinator', owner: old.owner } : {}),
+      ...(orphanedWrites.length ? { warning: 'Some declarations point at paths that no longer exist; re-register or pass --follow OLD=>NEW to remap them', orphanedWrites } : {}),
+    };
   });
 }
 /** Run a migrated record through the same normalization as any stored task. */
@@ -847,6 +942,7 @@ function undeclaredAudit(ws, options) {
     scope: 'undeclared-files',
     workspaceShape: shapeOf(ws),
     layout: artifactRoot(ws) ? 'container' : 'flat',
+    ...(() => { const d = layoutDrift(ws); return d ? { layoutDrift: d } : {}; })(),
     declaredFiles: live.reduce((n, t) => n + t.writes.length, 0),
     declaredDirectories: live.length,
     undeclaredFiles: found.length,
@@ -855,6 +951,22 @@ function undeclaredAudit(ws, options) {
     complete: !stopped,
     note: 'Inventory only: undeclared files are not a conflict and never fail check. hint describes the path shape, not ownership.',
   };
+}
+/**
+ * Does the recorded layout still describe reality?
+ *
+ * `config.artifacts` is written once at `init`. A user reorganising the tree by
+ * hand leaves it stale, and then every default path quietly points somewhere
+ * that no longer matches. Reported, never auto-corrected: the tool does not get
+ * to decide that a hand-made rearrangement was wrong.
+ */
+function layoutDrift(ws) {
+  const root = artifactRoot(ws);
+  if (!root) return null;
+  const dir = canonical(ws, root);
+  if (!present(dir)) return { recorded: root, observed: 'absent', hint: 'The configured artifact container does not exist; layout may have been changed by hand. Use move-artifacts to record the current arrangement.' };
+  const strays = conversationDirectories(ws).filter(d => !inside(dir, d));
+  return strays.length ? { recorded: root, observed: 'flat-directories-present', directories: strays.map(d => portable(ws, d)), hint: 'Conversation directories exist outside the recorded container. Use move-artifacts to record the current arrangement.' } : null;
 }
 function audit(ws, options) {
   if (!config(ws)) return { ok: false, complete: false, scope: 'undeclared-files', issues: page([{ type: 'not_enabled' }], options) };
@@ -974,7 +1086,30 @@ function scanFiles(ws, tasks) {
 }
 function compareFiles(before, after) {
   const old = new Map(before.map(f => [f.path, f.hash])), now = new Map(after.map(f => [f.path, f.hash]));
-  return [...new Set([...old.keys(), ...now.keys()])].sort().filter(p => old.get(p) !== now.get(p)).map(p => ({ path: p, change: !old.has(p) ? 'added' : !now.has(p) ? 'deleted' : 'modified' }));
+  const changed = [...new Set([...old.keys(), ...now.keys()])].sort().filter(p => old.get(p) !== now.get(p));
+  // Pair an addition with a deletion that carries the identical content: that is
+  // a move, not a modification. Without this, relocating a project reported every
+  // file as "changed", which reads as tampering and buries the real edits in the
+  // same number. Content hashes make the pairing exact; a genuine edit changes
+  // the hash and stays in the modified bucket.
+  const goneByHash = new Map();
+  for (const p of changed) {
+    if (now.has(p)) continue;
+    const h = old.get(p);
+    if (!goneByHash.has(h)) goneByHash.set(h, []);
+    goneByHash.get(h).push(p);
+  }
+  const moved = [];
+  const claimed = new Set();
+  for (const p of changed) {
+    if (!now.has(p) || old.has(p)) continue;
+    const candidates = (goneByHash.get(now.get(p)) ?? []).filter(q => !claimed.has(q));
+    if (!candidates.length) continue;
+    claimed.add(p); claimed.add(candidates[0]);
+    moved.push({ path: p, from: candidates[0], change: 'moved' });
+  }
+  const classified = changed.filter(p => !claimed.has(p)).map(p => ({ path: p, change: !old.has(p) ? 'added' : !now.has(p) ? 'deleted' : 'modified' }));
+  return [...moved, ...classified].sort((a, b) => a.path.localeCompare(b.path));
 }
 function checked(ws) {
   const s = snapshot(ws), scan = scanFiles(ws, s.tasks);
@@ -992,7 +1127,13 @@ function checked(ws) {
       if (sha(fs.readFileSync(sum)) !== baseline.summaryHash) alerts.push({ type: 'summary_content_changed' });
     } catch { alerts.push({ type: 'summary_missing_or_unreadable' }); }
   }
-  if (changes.length) alerts.push({ type: 'summary_files_stale', count: changes.length });
+  if (changes.length) {
+    const tally = { moved: 0, modified: 0, added: 0, deleted: 0 };
+    for (const c of changes) tally[c.change] += 1;
+    // The bare count alone could not distinguish "117 files were relocated" from
+    // "117 files were rewritten", and those demand opposite reactions.
+    alerts.push({ type: 'summary_files_stale', count: changes.length, ...tally });
+  }
   return { s, scan, changes, alerts, stateHash };
 }
 function check(ws, options) {
@@ -1070,15 +1211,24 @@ function owners(ws, options) {
   });
 }
 const HELP = 'Commands: init, task, migrate, archive, audit, move-artifacts, context, detail, owners, check, summary, handoff, session-check, recover-task. See references/commands.md and references/recovery.md; common: --workspace PATH --session ID. context/check: --limit 1..20 --offset N. migrate: --task ID --to DIR --expect-rev N [--move-files]. archive: --task ID --expect-rev N --reason TEXT.';
+// Options that may be given more than once.
+const REPEATABLE = new Set(['follow']);
 function parse(argv) {
   const command = argv[0], options = {};
   const flags = new Set(['adopt', 'ack-legacy', 'confirm-unavailable', 'move-files']);
-  const allowed = new Set(['workspace', 'session', 'to', 'file', 'task', 'since', 'expect-rev', 'expect-epoch', 'limit', 'offset', 'sessions-home', 'action', 'from', 'reason', 'resume', 'scope', 'artifacts', ...flags]);
+  const allowed = new Set(['workspace', 'session', 'to', 'file', 'task', 'since', 'expect-rev', 'expect-epoch', 'limit', 'offset', 'sessions-home', 'action', 'from', 'reason', 'resume', 'scope', 'artifacts', 'follow', ...flags]);
   for (let i = 1; i < argv.length; i++) {
     const key = argv[i].startsWith('--') ? argv[i].slice(2) : '';
-    if (!allowed.has(key) || key in options) fail('INVALID', 'Unknown or repeated option: ' + argv[i]);
+    // Repeatable options accumulate instead of being rejected; everything else
+    // stays single-valued so a typo cannot silently overwrite a flag.
+    if (!allowed.has(key) || (key in options && !REPEATABLE.has(key))) fail('INVALID', 'Unknown or repeated option: ' + argv[i]);
     if (flags.has(key)) options[key] = true;
-    else { if (!argv[i + 1] || argv[i + 1].startsWith('--')) fail('INVALID', 'Missing value: ' + key); options[key] = argv[++i]; }
+    else {
+      if (!argv[i + 1] || argv[i + 1].startsWith('--')) fail('INVALID', 'Missing value: ' + key);
+      const value = argv[++i];
+      if (!REPEATABLE.has(key)) options[key] = value;
+      else (options[key] ??= []).push(...String(value).split(',').filter(Boolean));
+    }
   }
   return { command, options };
 }

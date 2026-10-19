@@ -1,4 +1,4 @@
-# workspace-main-conversation v2.4.2
+# workspace-main-conversation v2.4.3
 
 一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) / Codex skill：
 **让共享工作区里的多个对话不再各干各的、互相撞车。**
@@ -11,6 +11,7 @@
 > 却没登记任务的目录。此前这类对话对统筹完全不可见（`tasks: 0` 和"什么都没干"
 > 长得一模一样），可能让已有产物的对话仍未进入统筹视图。
 > 变更细节见 [re_note.md](re_note.md)。
+> **v2.4.3 起**：主对话可以搬动子对话的目录与声明（需 `--reason`，记进 `lastActor`），但内容仍归 owner。
 > **v2.4.2 起**：产物目录默认平铺在根目录，名字就是任务 id，不加前缀不套容器；容器需显式指定。
 > **v2.3.3 起**：产物目录不再套 `conversations/` 那种把容器语义重复两遍的命名。
 > **v2.3.1 起**：任务目录放错不再是死局——`migrate` 提供正当代改口，`archive` 让主对话
@@ -168,11 +169,11 @@ node "$sk\zstd-frames.mjs" "<某个 session.v4.jsonl.zstd>"
 
 ```powershell
 $tests = (Get-ChildItem tests -Filter '*.test.mjs').FullName
-node --test $tests                # 120 项；链接权限受限时按原因跳过
+node --test $tests                # 128 项；链接权限受限时按原因跳过
 node selftest-portable.mjs        # 期望 {"ok":true,...}
 ```
 
-测试集合共 120 项。链接防护测试只有在 Windows 创建 junction 返回 `EPERM` 或 `EACCES` 时才标为 `SKIP`；其他错误仍会失败。跳过表示该环境没有执行链接防护断言，应在允许创建 junction 的环境重跑，不能记为通过。
+测试集合共 128 项。链接防护测试只有在 Windows 创建 junction 返回 `EPERM` 或 `EACCES` 时才标为 `SKIP`；其他错误仍会失败。跳过表示该环境没有执行链接防护断言，应在允许创建 junction 的环境重跑，不能记为通过。
 已在 Node v24.21.0 验证；zstd 功能需当前 Node 提供相应 API。
 
 ## 安全边界

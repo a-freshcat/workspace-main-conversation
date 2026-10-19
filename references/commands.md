@@ -91,6 +91,55 @@ state 可选 `planned/doing/blocked/done/cancelled`。前三者保留资源认�
 
 `context` 会向主对话报告未声明文件数（仅大于 0 时出现），`summary` 把数量写进 `sum.md`，因此这个数字不会长期无人过问。看到它就值得跑一次 `audit`。
 
+## 权限：owner 与主对话
+
+协作里有两类角色，它们的权限**不同**——把它们当平等个体是早期版本的设计错误，导致主对话能看见子对话的目录放错，却搬不动它。
+
+| 动作 | owner（正在干活的对话） | 主对话 |
+|---|---|---|
+| 改自己的 goal / state / next / result | ✅ | ❌（那是别人的工作内容） |
+| 改自己的 directory / writes | ✅ | ✅（**需要 `--reason`**） |
+| 搬别人的 directory / writes | ❌ | ✅（**需要 `--reason`**） |
+| 取消或转交别人的任务 | ❌ | ✅（走 `recover-task`） |
+| 归档终态记录 | ❌ | ✅ |
+| 换整体布局 | ❌ | ✅ |
+
+主对话的覆盖操作会在任务记录里留下 `lastActor` 和 `lastReason`，owner 下次读 `detail` 就能看到谁改了什么、为什么。**理由不是形式**：没有 `--reason` 的覆盖会被拒绝（`REASON_REQUIRED`）。
+
+这不降低 owner 的自主权：内容仍归 owner，主对话只动**位置与声明**。主对话也不能趁机夺取任务——记录里的 `owner` 始终是真正干活的那个会话。
+
+### 目录归属跟着任务走，不跟着命令执行者走
+
+搬动子对话的目录时，目录里的 `.session-id` 仍然写子对话的 id。早期实现按「谁执行命令」校验标记，于是主对话永远搬不动别人的目录——那不是安全边界，只是把角色搞混了。
+
+## 会话把整个项目放进自己的目录
+
+常见且合理：一个对话把自己的项目整个收进产物目录。此时：
+
+- `workspaceShape` 报 **`per-conversation-projects`**，并列出每个目录里的项目证据（`package.json`、`src/` 等），不再是 `vacant`；
+- 项目内部只要是相对路径，整体移动后仍可运行；
+- 如果文件是手工拖进去的，原有 `writes` 会全部指向旧位置，表现为一片 `missing_path`。用 `migrate --follow OLD=>NEW` 一次性重映射，可重复给出多组，也接受逗号分隔：
+
+```text
+node scripts/workspace.mjs migrate --workspace WS --session S --task ID --to DIR --expect-rev REV --follow src=>ID/src --follow assets=>ID/assets
+```
+
+没给的路径不会被猜：`migrate` 会把「迁移后仍不存在」的声明列在 `orphanedWrites` 并给出警告，让调用者自己决定。
+
+## 变更分类：移动不是修改
+
+`check` 报 `summary_files_stale` 时带分类计数：
+
+```json
+{"type":"summary_files_stale","count":2,"moved":2,"modified":0,"added":0,"deleted":0}
+```
+
+按内容哈希配对：新增与删除的内容相同时算一次 `moved`，**不重复计数**。真正被改写的内容哈希会变，落在 `modified`。这样「搬了 117 个文件」和「117 个文件被篡改」不再长得一样。
+
+## 布局漂移
+
+`config.artifacts` 在 `init` 时写入一次。若之后手工搬动目录，`audit` 的 `layoutDrift` 会指出记录与实际不符（记录的值、实际观察到的目录、建议用 `move-artifacts` 重新记录）。**只报告，不自动改**——工具无权判定手工整理是错的。
+
 ## 工作区形态与产物布局
 
 **产物目录默认平铺在工作区根目录，名字就是任务 id。** 不分形态，也不套容器。

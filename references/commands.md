@@ -93,34 +93,40 @@ state 可选 `planned/doing/blocked/done/cancelled`。前三者保留资源认�
 
 ## 工作区形态与产物布局
 
-**根目录是什么，决定了产物目录该放哪。** `init` 时检测一次并记进 `config.json` 的 `artifacts` 字段，之后所有默认路径都按它推导。
+**产物目录默认平铺在工作区根目录，名字就是任务 id。** 不分形态，也不套容器。
 
-### 空地型（vacant）
+这一点曾经被改错过两次，值得记下为什么：
 
-根目录没有项目，只有各对话的产物。布局为 **flat**：产物目录平铺在根目录，如 `conversation-mv`。
+- 一版把默认设成 `conversations/<任务id>`，多一层容器，把每个对话的目录推出了 `ls` 的视野；
+- 另一版反过来强制平铺，并把名字改成 `conversation-<任务id>`，结果把本来就叫 `mv` 的项目目录改名成了 `conversation-mv`——用户自己起的名字被覆盖，而那个目录本身是一个有 `package.json` 的独立项目。
 
-适合一次性的、以对话产出为主的场地——根目录就是所有人 `ls` 能看到的共同面。
+所以现在的规则只有一条：**默认就是任务 id，平铺，不改名。** 目录名是用户和对话的语义，脚本没有资格替它加前缀。
 
-### 项目型（project）
+### 项目型工作区怎么办
 
-根目录本身是一个代码库：有 `package.json`、`src/`、`tests/` 之类。布局为 **container**，默认容器名 `shared`，产物目录为 `shared/<任务>`。
+根目录本身是代码库（有 `src/`、`package.json`）时，对话目录**与项目结构并列**，各自用自己的名字：
 
-理由是项目根不能被动：构建脚本、相对路径、IDE 配置都指向根，把每个对话的目录平铺进去会把项目结构搅乱。**项目结构保持原样**，对话产物集中在一个容器里，根目录只多一个条目。
+```
+package.json  src/  tests/  index.html  mv/  game-demo-art/
+```
 
-### 混合型（mixed）
+项目结构不动。根目录条目多一点是正常的——那些条目大多是项目本身，不是杂乱。真正的杂乱是「同一个东西有两个名字」或「同一份产物散在多处」，不是「根目录有 src 也有对话目录」。
 
-根目录既有项目，又已经存在平铺的产物目录。`audit` 会把它们列在 `flatConversationDirectories` 里，用 `move-artifacts` 收进容器。
+`audit` 的 `workspaceShape` 会说明根目录是 `vacant`（只有产物）还是 `project`（本身是代码库）还是 `mixed`（两者都有），用于解释布局，不改变任何默认值。
 
-### 换布局
+### 需要容器时（可选）
+
+如果确实想把对话产物集中到一处，可以在 `init` 时显式指定，或之后用 `move-artifacts`：
 
 ```text
+node scripts/workspace.mjs init --workspace WORKSPACE --session SESSION --artifacts shared
 node scripts/workspace.mjs move-artifacts --workspace WORKSPACE --session SESSION --artifacts shared --expect-epoch EPOCH
 node scripts/workspace.mjs move-artifacts --workspace WORKSPACE --session SESSION --artifacts flat   --expect-epoch EPOCH
 ```
 
-只有主对话能改（它一次搬动所有对话的产物）。命令先规划全部迁移再动手：目标已存在、两个任务会撞到同一目录、有未完成的归拢计划、或 epoch 不对，都整体拒绝，不会留下半搬状态。搬运时目录内容、`directory` 和 `writes` 里的路径一起跟随；清空后的旧容器会被删除，所以 flat 是真的平。**不在当前容器下的任务目录不动**——那是别人显式指定的位置，不是默认布局。
+这是**选择**，不是默认。`move-artifacts` 只有主对话能调用（一次搬动所有对话的产物），先规划全部迁移再动手：目标已存在、两个任务撞同一目录、有未完成的归拢计划或 epoch 不对，都整体拒绝，不留半搬状态。目录内容、`directory` 和 `writes` 一起跟随；清空后的旧容器会被删除。**不在当前容器下的任务目录不动**——那是显式放置的位置，不是默认布局。
 
-`audit` 会输出 `workspaceShape`（含判定依据 `evidence`）和 `layout`，主对话据此向用户解释「为什么根目录长这样」，而不必每次重新论证。
+注意：目录被占用时（有进程持有其中的 `node_modules`、`out`）重命名会返回 `EPERM`，此时应先停掉相关进程，不要强搬。
 
 ### 判断某个文件该不该搬
 
@@ -128,4 +134,4 @@ node scripts/workspace.mjs move-artifacts --workspace WORKSPACE --session SESSIO
 2. 不是的话，它是某个对话的产物吗？→ 用 `migrate` 收进该任务的产物目录。
 3. 还是认不出？→ 问用户，**不要**按修改时间或名字猜。
 
-产物目录换个位置是布局问题，文件归属不清是归属问题——`audit` 只管后者，前者用 `move-artifacts`。
+产物目录换个位置是布局问题，文件归属不清是归属问题——`audit` 只管后者。

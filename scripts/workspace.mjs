@@ -22,7 +22,6 @@ const PROJECT_DIRS = ['src', 'lib', 'app', 'tests', 'test', 'docs', 'cmd', 'pkg'
 // Chosen so a project root keeps exactly one extra entry regardless of how many
 // conversations work in it, and so the per-task directory name does not repeat
 // the container's meaning (no `conversations/conversation-x`).
-const DEFAULT_ARTIFACTS = 'shared';
 
 /**
  * Is this workspace root an empty lot or a project?
@@ -172,7 +171,7 @@ const overlaps = (a, b) => a === b || inside(a, b) || inside(b, a);
  * name pass `directory` explicitly; this only removes the old
  * `conversations/<id>` wrapper, which no rule depended on.
  */
-function defaultDirectory(id, root) { return root ? `${root}/${id}` : `conversation-${id}`; }
+function defaultDirectory(id, root) { return root ? `${root}/${id}` : id; }
 function normalizeTask(ws, input, owner) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('INVALID', 'Task must be an object');
   const allowed = new Set(['id', 'goal', 'state', 'directory', 'writes', 'next', 'result', 'evidence']);
@@ -1040,7 +1039,7 @@ function init(ws, options) {
     if (options.artifacts !== undefined) {
       text(options.artifacts, 'artifacts', 64);
       artifacts = options.artifacts === 'flat' ? null : artifactContainer(options.artifacts);
-    } else if (detected.shape !== 'vacant') artifacts = DEFAULT_ARTIFACTS;
+    }
     atomic(path.join(root, 'config.json'), { schema: SCHEMA, workspace: ws, main: who, epoch: 1, artifacts });
     return { enabled: true, main: who, epoch: 1, layout: artifacts ? 'container' : 'flat', artifacts, detected };
   });

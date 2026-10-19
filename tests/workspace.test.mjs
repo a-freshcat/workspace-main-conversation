@@ -74,14 +74,14 @@ test('the default artifact directory is flat in the workspace root, not wrapped'
   fs.writeFileSync(p, JSON.stringify({ id: 'fix-export', goal: '修复导出', state: 'doing', writes: [], next: '' }));
   const made = run(ws, 'task', { session: 'child-a', file: p });
 
-  assert.equal(made.directory, 'conversation-fix-export');
-  assert.equal(fs.existsSync(path.join(ws, 'conversation-fix-export')), true);
-  assert.equal(fs.readFileSync(path.join(ws, 'conversation-fix-export/.session-id'), 'utf8').trim(), 'child-a');
+  assert.equal(made.directory, 'fix-export');
+  assert.equal(fs.existsSync(path.join(ws, 'fix-export')), true);
+  assert.equal(fs.readFileSync(path.join(ws, 'fix-export/.session-id'), 'utf8').trim(), 'child-a');
   // No wrapper container is created, and nothing lives under `conversations/`.
   assert.equal(fs.existsSync(path.join(ws, 'conversations')), false);
   // The directory is visible in the shared root, which is what makes `ls` a
   // usable inventory for the coordinator.
-  assert.ok(fs.readdirSync(ws).includes('conversation-fix-export'));
+  assert.ok(fs.readdirSync(ws).includes('fix-export'));
   // An explicit directory still wins, for dated names or nested layouts.
   task(ws, 'custom', 'child-b', { directory: 'conversation-2026-10-19-custom' });
   assert.equal(fs.existsSync(path.join(ws, 'conversation-2026-10-19-custom')), true);
@@ -638,23 +638,25 @@ function projectWorkspace() {
   run(ws, 'init', { session: 'main' });
   return ws;
 }
-test('a vacant root keeps conversation directories flat', () => {
+test('the default artifact directory is the task id, flat in the root', () => {
   const ws = workspace();
   const p = path.join(suite, `input-${++sequence}.json`);
   fs.writeFileSync(p, JSON.stringify({ id: 'fix-export', goal: '修复导出', state: 'doing', writes: [], next: '' }));
   const made = run(ws, 'task', { session: 'child-a', file: p });
-  assert.equal(made.directory, 'conversation-fix-export');
-  assert.equal(fs.existsSync(path.join(ws, 'conversation-fix-export')), true);
+  // No prefix and no container: the name the caller chose is the name on disk.
+  assert.equal(made.directory, 'fix-export');
+  assert.equal(fs.existsSync(path.join(ws, 'fix-export')), true);
 });
-test('a project root keeps its tree intact and collects artifacts in one container', () => {
+test('a project root keeps its own tree and adds conversation directories beside it', () => {
   const ws = projectWorkspace();
   const p = path.join(suite, `input-${++sequence}.json`);
-  fs.writeFileSync(p, JSON.stringify({ id: 'fix-export', goal: '修复导出', state: 'doing', writes: [], next: '' }));
+  fs.writeFileSync(p, JSON.stringify({ id: 'mv', goal: '做 MV', state: 'doing', writes: [], next: '' }));
   const made = run(ws, 'task', { session: 'child-a', file: p });
-  // The default lands inside the container, not next to src/ and package.json.
-  assert.equal(made.directory, 'shared/fix-export');
+  // Flat by default even here: the project's own directories are untouched, and
+  // the conversation directory sits beside them under its own name.
+  assert.equal(made.directory, 'mv');
   const root = fs.readdirSync(ws).sort();
-  assert.deepEqual(root.filter(n => !n.startsWith('.')), ['package.json', 'shared', 'src']);
+  assert.deepEqual(root.filter(n => !n.startsWith('.')), ['mv', 'package.json', 'src']);
 });
 test('the shape is reported so the layout can be explained', () => {
   const vacant = workspace();
@@ -664,19 +666,20 @@ test('the shape is reported so the layout can be explained', () => {
   const project = projectWorkspace();
   const audit = run(project, 'audit');
   assert.equal(audit.workspaceShape.shape, 'project');
-  assert.equal(audit.layout, 'container');
+  // Flat is the default for every shape; the shape only describes the root.
+  assert.equal(audit.layout, 'flat');
   assert.ok(audit.workspaceShape.evidence.includes('package.json'));
   assert.ok(audit.workspaceShape.evidence.includes('src/'));
 
-  // Flat conversation directories beside a project make the shape "mixed".
+  // A task directory in the root beside a project makes the shape "mixed".
   task(project, 'task-a', 'child-a', { directory: 'conversation-task-a' });
   assert.equal(run(project, 'audit').workspaceShape.shape, 'mixed');
   assert.deepEqual(run(project, 'audit').workspaceShape.flatConversationDirectories, ['conversation-task-a']);
 });
 test('move-artifacts relocates every task and its writes, both directions', () => {
   const ws = projectWorkspace();
-  // The default lands in the container; name it explicitly so the assertion is
-  // about the move, not about how the default is derived.
+  // Start from a container layout so there is something to flatten.
+  run(ws, 'move-artifacts', { session: 'main', artifacts: 'shared', 'expect-epoch': 1 });
   task(ws, 'alpha', 'child-a', { directory: 'shared/alpha', writes: ['shared/alpha/a.txt'] });
   fs.writeFileSync(path.join(ws, 'shared/alpha/a.txt'), 'x');
 
@@ -697,7 +700,8 @@ test('move-artifacts relocates every task and its writes, both directions', () =
 });
 test('move-artifacts is coordinator-only and refuses to overwrite', () => {
   const ws = projectWorkspace();
-  task(ws, 'alpha', 'child-a', { directory: 'shared/alpha' });
+  run(ws, 'move-artifacts', { session: 'main', artifacts: 'shared', 'expect-epoch': 1 });
+  task(ws, 'alpha', 'child-a', { directory: 'shared/alpha', writes: ['shared/alpha/a.txt'] });
   throwsCode(() => run(ws, 'move-artifacts', { session: 'child-a', artifacts: 'flat', 'expect-epoch': 1 }), 'NOT_MAIN');
   throwsCode(() => run(ws, 'move-artifacts', { session: 'main', artifacts: 'flat', 'expect-epoch': 9 }), 'EPOCH_MISMATCH');
   throwsCode(() => run(ws, 'move-artifacts', { session: 'main', 'expect-epoch': 1 }), 'INVALID');

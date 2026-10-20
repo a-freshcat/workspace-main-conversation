@@ -367,7 +367,7 @@ function brief(ws, t) { return { id: t.id, owner: t.owner, rev: t.rev, state: t.
 // to "this conversation has nothing registered" — so a child that could not
 // read its id saw a clean bill of health and did nothing. The state is not
 // normal, and the output now says so where the caller is already looking.
-const IDENTITY_HINT = 'Pass the session id explicitly, or pick it up automatically by running this command under pwsh, where the DSH runtime exports DSH_SESSION_ID ($env:DSH_SESSION_ID). ops_bash/bash receives no DSH_* variables, so `env` there shows nothing. Until the id is known this view cannot tell your tasks from another conversation\'s, and nothing may be registered or claimed.';
+const IDENTITY_HINT = 'Pass the current conversation id explicitly. In DSH, use the runtime DSH_SESSION_ID (the CLI reads it automatically in its provided pwsh environment); in Codex, use the current task thread id with the `codex:` prefix. Do not launch PowerShell from another executor to search for DSH_SESSION_ID or guess an id from a title. Until the current id is known this view cannot tell your tasks from another conversation\'s, and nothing may be registered or claimed.';
 function identity(who) {
   return who === 'unknown'
     ? { status: 'unknown', hint: IDENTITY_HINT }

@@ -1,6 +1,6 @@
 # 命令参考
 
-公共参数：`--workspace` 为已存在的工作区；修改操作的 `--session` 必须来自当前运行环境。只读的未知身份可用 `unknown`。参数值以实际值替换下文大写单词，路径有空格时加引号。Node 需具备 zstd API；核心协作不依赖 zstd 或外部 skill。
+公共参数：`--workspace` 为已存在的工作区；修改操作的 `--session` 必须标识当前对话。DSH 使用运行时 `DSH_SESSION_ID`；Codex 使用当前 thread ID，并传 `codex:<threadId>`。只读的未知身份可用 `unknown`。参数值以实际值替换下文大写单词，路径有空格时加引号。Node 需具备 zstd API；核心协作不依赖 zstd 或外部 skill。
 
 ```text
 node scripts/workspace.mjs init --workspace WORKSPACE --session SESSION
@@ -22,7 +22,9 @@ node scripts/workspace.mjs handoff --workspace WORKSPACE --session SESSION --to 
 node scripts/workspace.mjs session-check --workspace WORKSPACE --session MAIN_SESSION --sessions-home DSH_HOME
 ```
 
-`init` 只在用户要求启用管理并指定主对话时调用。它会检测工作区形态并决定产物目录布局（见下节），可用 `--artifacts NAME` 或 `--artifacts flat` 显式覆盖。已有 v1 的 `sum.md` / `main.md` 时额外传 `--ack-legacy`，先读迁移参考；不会导入或猜测旧 owner。
+`init` 在用户明确指定本对话为主对话时调用；该指派就是授权，不要重复询问。先解析当前平台身份：Codex 的当前 thread ID 以 `codex:<threadId>` 传入，DSH 的 `DSH_SESSION_ID` 可由 CLI 自动读取。它会检测工作区形态并决定产物目录布局（见下节），可用 `--artifacts NAME` 或 `--artifacts flat` 显式覆盖。已有 v1 的 `sum.md` / `main.md` 时额外传 `--ack-legacy`，先读迁移参考；不会导入或猜测旧 owner。
+
+用户还要求创建主对话自己的目录时，`init` 成功后将当前指派作为主对话任务登记，提供唯一 `id` 和与之对应的 `directory`；`task` 会创建目录并写入本会话 `.session-id`。若没有单独工作目标，就把“统筹工作区协作”作为任务目标。读取当前简报并检查目录冲突后再选择 id；不得只初始化主身份而遗漏明确要求的目录。
 
 任务输入是完整的当前快照，UTF-8 JSON：
 
@@ -57,7 +59,7 @@ state 可选 `planned/doing/blocked/done/cancelled`。前三者保留资源认�
 
 `unregistered` 是登记表之外的另一条线索：工作区里带 `.session-id` 归属标记、却不属于任何登记任务的目录。每项给出 `path`（相对工作区）、`owner`（标记里写的会话）、`files`（该目录下普通文件数）。main 看到全部，child 只看到 `owner` 等于自己的那些；没有内容时整个字段省略。判据是归属标记而不是目录存在，因此 `src/`、`docs/` 这类普通目录和没有标记的目录永不被报告；挂载点、链接和 `.git/.workspace/node_modules/.venv/venv/dist/build/__pycache__` 不参与。扫描上限为深度 4、50 个目录、每目录 5000 文件，达到上限时结果不完整，不能当作"没有更多"。该字段只读，登记任务后对应目录自然消失；它不替代 `check` 的文件内容比对。
 
-`identity` 在已启用工作区且 `role=unknown` 时出现，形如 `{"status":"unknown","hint":"…"}`。它说明本次调用没能确定会话身份：此时 `taskCount: 0` 不代表你没有任务，任何登记和认领都会失败。取 id 的可靠来源是 `pwsh` 的 `DSH_SESSION_ID`；`ops_bash`/bash 不传任何 `DSH_*` 变量，在那里 `env` 查不到。CLI 在缺少 `--session` 时用 `DSH_SESSION_ID` 兜底，对所有需要身份的核心命令生效，显式 `--session` 优先；导出的 `execute()` 不读环境，只有 CLI 入口读。
+`identity` 在已启用工作区且 `role=unknown` 时出现，形如 `{"status":"unknown","hint":"…"}`。它说明本次调用没能确定会话身份：此时 `taskCount: 0` 不代表你没有任务，任何登记和认领都会失败。DSH 的 CLI 可在缺少 `--session` 时从 `DSH_SESSION_ID` 兜底；Codex 应使用当前任务 thread ID 并显式传 `--session codex:<threadId>`。不要在 Codex 中启动 PowerShell 搜索 DSH 变量。显式 `--session` 优先；导出的 `execute()` 不读环境，只有 CLI 入口读。
 
 `audit` 是只读盘点：列出工作区里没有任何**活动**任务声明的文件，按目录聚合，可用 `--limit/--offset` 分页，`--scope root` 只看根目录一层。`hint` 只描述路径形态（`root-level-file` / `undeclared-tree`），不做归属判断；未声明文件**永不导致 `check` 失败**，也不参与冲突判定。`complete: false` 表示扫描触达上限，此时清单不完整，不能当作「没有更多」。
 

@@ -3,30 +3,29 @@ name: workspace-main-conversation
 description: 管理共享工作区的对话分工、文件归属与认领归拢；进入已启用的工作区、共享写入或整理散落产物时使用。
 ---
 
-# 工作区协作 v2.4.4
+# 工作区协作 v2.4.5
 
 目标：用少量状态支持协作，细节按需读取。具体任务分工以用户指派为准。脚本路径相对本 skill 目录；工作区参数用绝对路径。适用于 Codex 和 DSH。
 
 ## 进入或恢复
 
-运行 `node scripts/workspace.mjs context --workspace WORKSPACE --session SESSION`。
-SESSION 使用运行环境给出的当前对话 id；不可获取时保留 unknown，不猜身份、不认领。
-未启用时继续用户原任务；只有用户明确指定主对话并启用管理时才执行 `init`。
+先解析当前对话身份，再运行 `node scripts/workspace.mjs context --workspace WORKSPACE --session SESSION`。
+DSH 使用运行时提供的 `DSH_SESSION_ID`；Codex 使用当前任务的 Codex thread ID，并传 `codex:<threadId>`。
+未启用时继续用户原任务；用户明确指定本对话为主对话时执行 `init`，不要再要求重复授权。
+用户同时要求创建本对话目录时，`init` 成功后立即登记当前任务；`task` 会创建目录并写入归属标记。
 新上下文先取完整简报；同一上下文后续传上次完整处理过的 `--since STAMP`，只读变化。
 `scope=declared-metadata` 只检查登记信息；它不证明源文件未变。
 
-**取 SESSION：`pwsh` 里有 `DSH_SESSION_ID`，`ops_bash`/bash 里没有任何 `DSH_*`。**
-用 bash 跑 `env` 找 id 一定是空的——那是执行器的差异，不是你不在会话里。
-CLI 会自己读 `DSH_SESSION_ID` 兜底，所以在 `pwsh` 下不传 `--session` 也能识别身份。
-已启用的工作区仍取不到时 `role=unknown`，输出会带 `identity.status=unknown` 与原因，**不要把它当正常结果**：
-此时什么都登记不了，也不要为了拿到 id 去翻会话日志或猜。先在 `pwsh` 下重跑一次、
-或让用户把 id 告诉你，再继续。
+**取 SESSION：**在 DSH 中用 DSH 提供的 `pwsh` 环境；CLI 可从 `DSH_SESSION_ID` 自动取值。不要从 bash 查找该变量，也不要为了查它另开 PowerShell。
+在 Codex 中使用 Codex 当前任务的 thread ID，并显式传 `--session codex:<threadId>`；可用 Codex 任务上下文或应用任务工具确认当前 ID，不要按标题或最近活动猜其他对话。
+只有当前平台确实没有提供当前对话 ID 时，才请求用户提供；不能用 `unknown` 执行登记、认领或 `init`。`role=unknown` 是身份未解析的诊断，不代表没有任务。
 
 ## 执行
 
 - `role=main`：默认负责统筹登记任务、审查冲突与重复劳动；阶段结束用 `summary` 生成 `sum.md`。具体执行任务听从使用者指派，不按 bug 大小预设分工。
 - `role=child`：按使用者指派执行任务，只维护自己的任务记录和产物；需要上下文时优先 `detail --task ID`。
 - 接任务、状态变化、结果交接时用 `task --file INPUT.json` 登记；字段和命令见 [命令参考](references/commands.md)。普通回复无需改台账。
+- 用户明确要求创建本对话自己的文件夹时，把当前指派登记为本对话任务，设置独立 `id` 与 `directory`，并通过 `task` 创建目录；不要只运行 `init` 后结束。
 - 共享写入前先登记 `writes`；认领冲突则串行交接。`check` 核对已登记路径，编辑前重读目标文件。
 - `context` 报 `undeclaredCount` 时说明有没被任何任务声明的文件，值得跑一次 `audit` 盘点（只读）。未声明文件不是错误，不会让 `check` 失败；公共项目文件属于项目基线，不要因为未声明就搬进个人目录。
 - 产物目录默认平铺在根目录，名字用任务 id，不加前缀不套容器。需要集中到容器才用 `init --artifacts NAME` 或 `move-artifacts`（仅主对话）。

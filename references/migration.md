@@ -5,7 +5,8 @@
 1. 用户指定主对话后执行 init；发现原 sum.md/main.md 时需 --ack-legacy。
 2. 原 `.session-id`、sum.md、README 都保留。逐个确认要登记的任务与负责人；仅提到某 session、写操作较多、mtime 较新都不能证明 owner。
 3. 由各实际负责人登记自己的任务。非空目录缺标记时先确认归属，再显式 --adopt；存在其他 owner 标记时拒绝接管。
-4. v1/手工 sum.md 不会被 summary 覆盖。用户决定保留位置并手工移动旧文件后，才能在根目录生成新汇总。安装和 init 不会搬动旧产物。
+4. v1/手工 sum.md 不会被 summary 覆盖。用户决定保留位置并手工移动旧文件后，才能在根目录生成汇总页。安装和 init 不会搬动旧产物。
+5. v2.5 起汇总页叫 `AGENTS.md`。由 v2.4 的 `summary` 生成过、首行带 `<!-- workspace-main-conversation:v2 -->` 的 `sum.md` 会在下一次 `summary` 时自动迁移；手写 `sum.md` 和手写 `AGENTS.md` 都不会被动，前者报 `LEGACY_SUMMARY`、后者报 `AGENTS_FOREIGN`，需要先合并或移走。
 
 ## DSH 取证
 

@@ -1,10 +1,13 @@
-# workspace-main-conversation v2.4.5
+# workspace-main-conversation v2.5.0
 
 一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) / Codex skill：
 **让共享工作区里的多个对话不再各干各的、互相撞车。**
 
 无需 npm 包，不调用模型或 API，核心协作只用 Node 基础内置模块。
 
+> **v2.5.0 起**：统筹页从 `sum.md` 改名为根目录的 `AGENTS.md`。agent 会把 `AGENTS.md`
+> 作为基线指令随请求注入，所以"这个目录是什么"在对话开始前就有答案，不用等人打开文件；
+> 旧的 v2.4 `sum.md` 由 `summary` 自动迁移，手写的 `AGENTS.md` 一律不覆盖。
 > **v2.2.1 起**：`role=unknown` 会带 `identity` 说明自己没拿到会话身份，
 > 不再伪装成 `taskCount: 0` 的正常结果；CLI 也会用 `DSH_SESSION_ID` 兜底。
 > **v2.2 起**：`context` 会报告 `unregistered`——工作区里带 `.session-id` 归属标记
@@ -103,7 +106,7 @@ node "$sk\audit-owners.mjs" $ws
 - **看到 `unregistered` 就登记**：`context` 报出 `unregistered` 时，其中 `owner` 等于本会话的
   目录就是本对话的产物——**先 `task` 登记再继续干活**。不登记主对话就看不见你，
   冲突审查也无从谈起。主对话看到的是全部未登记归属，但**不能替子对话登记**。
-- **主对话**：默认统筹登记任务、处理 alerts、审查冲突与重复劳动；阶段结束用 `summary` 生成 `sum.md`。具体执行任务听从使用者指派，不预设按 bug 大小分工。
+- **主对话**：默认统筹登记任务、处理 alerts、审查冲突与重复劳动；阶段结束用 `summary` 生成根目录的 `AGENTS.md`。具体执行任务听从使用者指派，不预设按 bug 大小分工。
 - **子对话**：按使用者指派执行任务，只维护自己的任务记录和产物；需要上下文时优先 `detail --task ID`。
 - **共享写入前**先登记 `writes`；认领冲突则串行交接。
 - **产物目录放错了**：用 `migrate` 改正，不要手工改 `.workspace/tasks/*.json`。`task` 会拒绝静默改目录，但报错里直接给出可执行的 `migrate` 调用。
@@ -148,7 +151,8 @@ node "$sk\zstd-frames.mjs" "<某个 session.v4.jsonl.zstd>"
 
 **为什么需要文件当凭证，不用数据库？**
 文件跨工具、跨版本都能读。DSH 升级、换机器、手工编辑都不失效。
-`.workspace/config.json` 是唯一主身份；`sum.md` 是给人看的汇总。
+`.workspace/config.json` 是唯一主身份；`AGENTS.md` 是给人看的汇总，也是 agent 进入
+本目录时自动读到的那份说明。
 
 **为什么孤儿目录比"目录数不对"更重要？**
 一个对话合法拥有多个目录（主方案 + 副产品）很常见。

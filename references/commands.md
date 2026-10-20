@@ -65,7 +65,9 @@ state 可选 `planned/doing/blocked/done/cancelled`。前三者保留资源认�
 
 `owners` 只验证登记产物的显式归属标记，不扫描文件正文。`check` 递归检查**活动任务**的产物和 writes，比较内容哈希与上次 summary 的扫描快照，检测新增/修改/删除；终态（done/cancelled）任务不再占用资源，其目录按历史对待，不参与扫描和归属校验——目录被正常清理不会让基线失效。根目录共享文件须在 writes 里登记。默认每组 5 项，可用 limit/offset 分页。扫描不跟随符号链接，跳过 `.git/.workspace/node_modules/.venv/venv/dist/build/__pycache__`，这些目录若被直接登记为资源仍扫描根目录本身。上限为 5000 文件、20000 路径、单文件 16 MiB、合计 64 MiB；达到上限、读取错误、链接或扫描期间变更都明确标为 incomplete，不能给出无冲突保证。
 
-首次没有扫描基线会提示 baseline_missing；主对话检查后用 summary 建立基线。summary 保存的是内容哈希，不靠 mtime 判断，内容相同不会反复重写。只生成 v2 维护的 sum.md；遇到手工/v1 文件保留原件并拒绝覆盖。
+首次没有扫描基线会提示 baseline_missing；主对话检查后用 summary 建立基线。summary 保存的是内容哈希，不靠 mtime 判断，内容相同不会反复重写。
+
+summary 把统筹页写到根目录的 `AGENTS.md`：该文件是 agent 设置会自动注入的基线说明，所以「这个目录是干什么的」在对话开始前就有答案。文件首页是 `<!-- workspace-main-conversation:agents:v1 -->`，正文含目录约定、任务表和未声明文件数。三种文件不会被覆盖：手写的 `AGENTS.md` 直接报 `AGENTS_FOREIGN` 并原样保留；手工/v1 的 `sum.md` 报 `LEGACY_SUMMARY`；只有本 skill 生成过的 v2.4 `sum.md` 会被迁移成 `AGENTS.md`，返回 `migratedFrom: "sum.md"` 并删除旧文件。`check` 读 `AGENTS.md`，没有它时回退读旧的 `sum.md`，所以升级当口不会误报缺页。
 
 输出为单行 JSON。退出码：0 操作成功或指定检查范围内无问题；1 有待处理的问题；2 输入/权限/身份/解析问题。`more` 表示输出尚未显示全部，不会静默丢掉异常；增加 offset 获取后续。failed/unknown/incomplete 不等于正常。资源冲突和占用任务返回错误；拿到对方最新状态后再协调。
 
@@ -91,7 +93,7 @@ state 可选 `planned/doing/blocked/done/cancelled`。前三者保留资源认�
 2. 是某个对话的输出却留在根目录 → 让该对话认领，或用 `migrate` 收进它的产物目录。
 3. 认不出归属 → 用 `hint` 和 `docs/` 的项目说明判断，**不要**按修改时间或名字猜。
 
-`context` 会向主对话报告未声明文件数（仅大于 0 时出现），`summary` 把数量写进 `sum.md`，因此这个数字不会长期无人过问。看到它就值得跑一次 `audit`。
+`context` 会向主对话报告未声明文件数（仅大于 0 时出现），`summary` 把数量写进 `AGENTS.md`，因此这个数字不会长期无人过问。看到它就值得跑一次 `audit`。
 
 ## 权限：owner 与主对话
 

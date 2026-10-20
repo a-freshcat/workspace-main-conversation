@@ -1,4 +1,13 @@
-# v2.4.5 修订记录
+# v2.5.0 修订记录
+
+## 统筹页改为 AGENTS.md（v2.5.0）
+
+- 起因：`sum.md` 只有被人主动打开才起作用，而 agent 进入目录时不会先翻一遍根目录有什么文件。「这个目录是干什么的」应当在对话开始前就有答案。
+- 依据：DSH 的 `@deepseek-ai/dsh-agent-instructions` 把 `AGENTS.md`（以及 `CLAUDE.md`）作为基线指令随首个请求注入——默认 64 KiB 预算，`.git` 所在目录算项目根，从根到当前工作目录逐级加载，同级重复内容只渲染一次，写入更深目录后下一轮自动补上。Codex 也原生支持 `AGENTS.md`。生成到这个名字，等于免费获得「每个进入本目录的 agent 都会读」。
+- 改法：`summary` 写到根目录 `AGENTS.md`，首行标记 `<!-- workspace-main-conversation:agents:v1 -->`；正文新增「本目录的约定」，把 `.workspace/` 的元数据、owner 与协调者的权限边界、写入登记和目录命名一次讲清，任务表与未声明计数照旧。正文不含时间戳，重复执行仍是同样字节。
+- 三种文件不会被覆盖：手写 `AGENTS.md` → `AGENTS_FOREIGN` 并原样保留；手工/v1 `sum.md` → `LEGACY_SUMMARY`；只有本 skill 生成过的 v2.4 `sum.md` 会被迁移，返回 `migratedFrom: "sum.md"` 并删除旧文件。
+- `check` 优先读 `AGENTS.md`，缺失时回退读 `sum.md`，升级当口不会误报缺页；`OWNED` 同时保留两个名字，旧 `sum.md` 不会突然变成未声明文件。
+- 测试 +3（共 131）：生成位置与「说明目录」正文、手写 `AGENTS.md` 拒绝覆盖、v2.4 `sum.md` 迁移；原有用例的路径期望同步改名。
 
 ## 修复 Codex 身份解析与主对话建档（v2.4.5）
 

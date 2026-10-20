@@ -1,4 +1,4 @@
-# workspace-main-conversation v2.4.4
+# workspace-main-conversation v2.4.5
 
 一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) / Codex skill：
 **让共享工作区里的多个对话不再各干各的、互相撞车。**
@@ -12,6 +12,7 @@
 > 长得一模一样），可能让已有产物的对话仍未进入统筹视图。
 > 变更细节见 [re_note.md](re_note.md)。
 > **v2.4.3 起**：主对话可以搬动子对话的目录与声明（需 `--reason`，记进 `lastActor`），但内容仍归 owner。
+> **v2.4.5 起**：Codex 使用当前 thread ID（`codex:<id>`）作为会话身份；用户明确指定主对话后直接初始化，明确要求个人目录时继续登记任务并创建目录。
 > **v2.4.2 起**：产物目录默认平铺在根目录，名字就是任务 id，不加前缀不套容器；容器需显式指定。
 > **v2.3.3 起**：产物目录不再套 `conversations/` 那种把容器语义重复两遍的命名。
 > **v2.3.1 起**：任务目录放错不再是死局——`migrate` 提供正当代改口，`archive` 让主对话
@@ -97,11 +98,8 @@ node "$sk\audit-owners.mjs" $ws
 ## 用法要点
 
 - **进入已启用的工作区**：先跑 `context` 取简报；同一对话后续传上次的 `--since`，只读变化。
-- **取会话 id 用 `pwsh`**：`pwsh` 里有 `DSH_SESSION_ID`，`ops_bash`/bash 里没有任何 `DSH_*`。
-  在 bash 里跑 `env` 找不到 id 是执行器差异，不代表你不在会话里。CLI 会自动用
-  `DSH_SESSION_ID` 兜底（所有需要身份的命令都生效），显式 `--session` 优先。
-  已启用的工作区仍取不到时 `role=unknown` 并带 `identity.status=unknown`——**那不代表你没有任务**，
-  此时什么都登记不了，先在 `pwsh` 重跑或问用户，不要翻日志猜。
+- **按平台取会话 id**：DSH 使用运行时的 `DSH_SESSION_ID`；Codex 使用当前 thread ID 并传 `--session codex:<id>`。不要在 Codex 中启动 PowerShell 查找 DSH 专属变量。CLI 对 DSH 命令自动读取 `DSH_SESSION_ID`，显式 `--session` 优先。
+  若当前平台没有提供当前对话 id，`role=unknown` 会带 `identity.status=unknown`——**那不代表你没有任务**；先检查该平台的当前任务元数据，确实不可用时再问用户，不要猜或翻会话正文。
 - **看到 `unregistered` 就登记**：`context` 报出 `unregistered` 时，其中 `owner` 等于本会话的
   目录就是本对话的产物——**先 `task` 登记再继续干活**。不登记主对话就看不见你，
   冲突审查也无从谈起。主对话看到的是全部未登记归属，但**不能替子对话登记**。
